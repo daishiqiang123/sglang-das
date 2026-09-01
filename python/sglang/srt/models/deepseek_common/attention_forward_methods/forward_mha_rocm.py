@@ -14,6 +14,9 @@ import torch
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
@@ -192,7 +195,25 @@ class DeepseekMHARocmForwardMixin:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        self._set_mla_kv_buffer_rocm(latent_cache, kv_a, k_pe, forward_batch)
+        if (
+            is_cp_v2_active(forward_batch)
+            and mla_use_prefill_cp(forward_batch)
+        ):
+            # MHA_ONE_SHOT's core calls the backend with save_kv_cache=False,
+            # so the prepare phase owns the persistent MLA cache write.  Gather
+            # rank-local latent K/K-RoPE into natural order before writing it;
+            # writing the local shard directly through out_cache_loc would map
+            # zigzag rows onto the wrong global positions.
+            cp_strategy = get_cp_strategy()
+            assert cp_strategy is not None
+            cp_strategy.materialize_full_mla_kv(
+                forward_batch,
+                self.attn_mha,
+                kv_a.unsqueeze(1),
+                k_pe,
+            )
+        else:
+            self._set_mla_kv_buffer_rocm(latent_cache, kv_a, k_pe, forward_batch)
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
