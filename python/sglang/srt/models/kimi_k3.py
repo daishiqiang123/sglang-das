@@ -36,6 +36,11 @@ from sglang.srt.layers import (
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.cp.utils import (
+    cp_materialize_global_token_order,
+    cp_shard_hidden_states,
+    is_cp_v2_active,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -73,6 +78,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -359,7 +365,15 @@ class KimiK3MLP(nn.Module):
         # DP attention only when driven from the decoder layer (forward_batch
         # given); the shared-experts instance inside KimiK3MoE passes None and
         # runs on the already-gathered buffer.
-        use_dp = self._dp_attention and forward_batch is not None
+        use_cp = forward_batch is not None and is_cp_v2_active(forward_batch)
+        # The dense MLP is sharded across the full TP group. CP ranks own
+        # different token rows, so materialize natural token order before its
+        # full-TP collectives and restore the local zigzag shard afterwards.
+        if use_cp:
+            hidden_states = cp_materialize_global_token_order(
+                hidden_states, forward_batch
+            )
+        use_dp = self._dp_attention and forward_batch is not None and not use_cp
         if use_dp:
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
@@ -371,6 +385,8 @@ class KimiK3MLP(nn.Module):
             global_out = hidden_states
             hidden_states = get_local_dp_buffer(_dp_local_buffer_group())
             dp_scatter(hidden_states, global_out, forward_batch)
+        elif use_cp:
+            hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
         # TODO(dark): maybe fuse residual with all reduce of down projection
         if prefix_sum is not None:
             hidden_states = hidden_states + prefix_sum
@@ -1293,7 +1309,18 @@ class KimiK3MoE(nn.Module):
         every rank (tp-fold redundant compute + a2a traffic)."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        use_dp = self._dp_attention and forward_batch is not None and not self._ep_a2a
+        use_cp = forward_batch is not None and is_cp_v2_active(forward_batch)
+        if use_cp:
+            hidden_states = cp_materialize_global_token_order(
+                hidden_states, forward_batch
+            )
+            cp_prefix_sum, prefix_sum = prefix_sum, None
+        use_dp = (
+            self._dp_attention
+            and forward_batch is not None
+            and not self._ep_a2a
+            and not use_cp
+        )
         if use_dp:
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
@@ -1309,6 +1336,10 @@ class KimiK3MoE(nn.Module):
             dp_scatter(out, global_out, forward_batch)
             if dp_prefix_sum is not None:
                 out = out + dp_prefix_sum
+        elif use_cp:
+            out = cp_shard_hidden_states(out, forward_batch)
+            if cp_prefix_sum is not None:
+                out = out + cp_prefix_sum
         return out.view(num_tokens, hidden_size)
 
 
@@ -1860,6 +1891,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
+            mla_enable_prefill_cp=is_mla_prefill_cp_enabled(),
             skip_rope=True,
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
@@ -2236,7 +2268,13 @@ class KimiK3DecoderLayer(nn.Module):
         # output back; padded rows are discarded downstream.
         num_padded = hidden_states.shape[0]
         num_real = num_padded
-        if self._trim_padded_attn and forward_batch.forward_mode.is_extend():
+        cp_metadata = forward_batch.attn_cp_metadata
+        if cp_metadata is not None:
+            per_rank_tokens = (
+                cp_metadata.per_rank_logical_token or cp_metadata.per_rank_actual_token
+            )
+            num_real = min(int(per_rank_tokens[get_parallel().attn_cp_rank]), num_padded)
+        elif self._trim_padded_attn and forward_batch.forward_mode.is_extend():
             extend_lens = forward_batch.extend_seq_lens_cpu
             if extend_lens is not None:
                 num_real = min(int(sum(extend_lens)), num_padded)
@@ -2330,7 +2368,6 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states, _, _ = self._finish_attn_reduce(
             hidden_states, allow_scatter=False
         )
-
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual, False
@@ -2461,7 +2498,6 @@ class KimiK3DecoderLayer(nn.Module):
                 self.post_attention_layernorm,
                 rows=rows,
             )
-
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
         out = self.mlp(
@@ -2549,10 +2585,12 @@ class KimiK3LinearModel(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+            embeds = input_embeds if input_embeds is not None else inputs_embeds
+            if embeds is not None:
+                hidden_states = embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual = None
@@ -3202,6 +3240,22 @@ class KimiK3ForConditionalGeneration(nn.Module):
     @property
     def model(self):
         return self.language_model
+
+    @property
+    def logits_processor(self):
+        return self.language_model.logits_processor
+
+    @property
+    def capture_aux_hidden_states(self):
+        return self.language_model.capture_aux_hidden_states
+
+    @property
+    def pp_group(self):
+        return self.language_model.pp_group
+
+    def get_context_parallel_model(self):
+        """Return the text backbone between the CP shard and gather."""
+        return self.language_model.model
 
     def __setattr__(self, name, value):
         if name == "model":

@@ -18,6 +18,9 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.mla_cp import (
+    build_hcu_mla_cp_varlen_halves,
+)
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -30,7 +33,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -55,7 +58,6 @@ _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
 _is_hcu = is_hcu()
-
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
     if is_hcu():
         props = torch.cuda.get_device_properties(0)
@@ -1559,6 +1561,16 @@ class FlashAttentionBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
+                if (
+                    _is_hcu
+                    and is_cp_v2_active(forward_batch)
+                    and forward_batch.attn_attend_prefix_cache
+                ):
+                    raise NotImplementedError(
+                        "HCU MLA local-Q varlen PCP does not yet support "
+                        "chunked prefix-cache attention. Run the initial "
+                        "validation with --disable-radix-cache."
+                    )
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
                     assert not get_schedule().disable_chunked_prefix_cache
@@ -1588,35 +1600,151 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    cu_seqlens_k = (
-                        metadata.cu_seqlens_q
-                        if not forward_batch.mha_one_shot
-                        else metadata.cu_seqlens_k
-                    )
-                    max_seqlen_k = (
-                        metadata.max_seq_len_q
-                        if not forward_batch.mha_one_shot
-                        else metadata.max_seq_len_k
-                    )
-                    k = k.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else k
-                    v = v.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else v
-                    output = flash_attn_varlen_func(
-                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
-                        cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k=cu_seqlens_k,
-                        max_seqlen_q=metadata.max_seq_len_q,
-                        max_seqlen_k=max_seqlen_k,
-                        softmax_scale=layer.scaling,
-                        causal=True,
-                        k_descale=fa_k_descale,
-                        v_descale=fa_v_descale,
-                        return_softmax_lse=forward_batch.mha_return_lse,
-                        out=_fa_out,
-                        ver=self.fa_impl_ver,
-                        **kwargs,
-                    )
+                    cp_varlen_mode = None
+                    cp_varlen_halves = None
+                    local_q_num_tokens = q.shape[0]
+                    if _is_hcu and is_cp_v2_active(forward_batch):
+                        # True HCU MLA PCP: keep rank-local zigzag Q, gather only
+                        # natural-order K/V, and pack the causal KV prefix needed
+                        # by each local prev/next query block.
+                        cp_strategy = get_cp_strategy()
+                        assert cp_strategy is not None
+                        assert not forward_batch.mha_return_lse
+                        full_k = cp_strategy.gather_hidden_states(
+                            k.contiguous().view(
+                                -1, layer.tp_k_head_num, layer.head_dim
+                            ),
+                            forward_batch,
+                        )
+                        full_v = cp_strategy.gather_hidden_states(
+                            v.contiguous().view(
+                                -1, layer.tp_k_head_num, layer.v_head_dim
+                            ),
+                            forward_batch,
+                        )
+                        cp_varlen_mode = "local-q"
+                        cp_meta = forward_batch.attn_cp_metadata
+                        logical_q_tokens = (
+                            cp_meta.total_q_prev_tokens
+                            + cp_meta.total_q_next_tokens
+                        )
+                        q = q.contiguous().view(
+                            -1, layer.tp_q_head_num, layer.head_dim
+                        )[:logical_q_tokens]
+                        cp_varlen_halves = build_hcu_mla_cp_varlen_halves(
+                            full_k,
+                            full_v,
+                            forward_batch,
+                            cp_size=get_parallel().attn_cp_size,
+                        )
+                    else:
+                        cu_seqlens_q_cp = metadata.cu_seqlens_q
+                        cu_seqlens_k_cp = (
+                            metadata.cu_seqlens_q
+                            if not forward_batch.mha_one_shot
+                            else metadata.cu_seqlens_k
+                        )
+                        max_seqlen_q_cp = metadata.max_seq_len_q
+                        max_seqlen_k_cp = (
+                            metadata.max_seq_len_q
+                            if not forward_batch.mha_one_shot
+                            else metadata.max_seq_len_k
+                        )
+                    def _run_hcu_mla_varlen(
+                        q_arg,
+                        k_arg,
+                        v_arg,
+                        cu_seqlens_q_arg,
+                        cu_seqlens_k_arg,
+                        max_seqlen_q_arg,
+                        max_seqlen_k_arg,
+                        out_arg,
+                    ):
+                        # FlashAttention's varlen interface requires both
+                        # cumulative-length tensors to be int32.
+                        cu_seqlens_q_arg = cu_seqlens_q_arg.to(
+                            device=q_arg.device, dtype=torch.int32
+                        )
+                        cu_seqlens_k_arg = cu_seqlens_k_arg.to(
+                            device=k_arg.device, dtype=torch.int32
+                        )
+                        k_arg = (
+                            k_arg.to(self.kv_cache_dtype)
+                            if is_nmz_fp8(self.kv_cache_dtype)
+                            else k_arg
+                        )
+                        v_arg = (
+                            v_arg.to(self.kv_cache_dtype)
+                            if is_nmz_fp8(self.kv_cache_dtype)
+                            else v_arg
+                        )
+                        return flash_attn_varlen_func(
+                            q=q_arg.view(
+                                -1, layer.tp_q_head_num, layer.head_dim
+                            ),
+                            k=k_arg.view(
+                                -1, layer.tp_k_head_num, layer.head_dim
+                            ),
+                            v=v_arg.view(
+                                -1, layer.tp_k_head_num, layer.v_head_dim
+                            ),
+                            cu_seqlens_q=cu_seqlens_q_arg,
+                            cu_seqlens_k=cu_seqlens_k_arg,
+                            max_seqlen_q=max_seqlen_q_arg,
+                            max_seqlen_k=max_seqlen_k_arg,
+                            softmax_scale=layer.scaling,
+                            causal=True,
+                            k_descale=fa_k_descale,
+                            v_descale=fa_v_descale,
+                            return_softmax_lse=forward_batch.mha_return_lse,
+                            out=out_arg,
+                            ver=self.fa_impl_ver,
+                            **kwargs,
+                        )
+
+                    if cp_varlen_mode == "local-q":
+                        half_outputs = []
+                        for half in cp_varlen_halves:
+                            if half.q_start == half.q_end:
+                                continue
+                            half_outputs.append(
+                                _run_hcu_mla_varlen(
+                                    q[half.q_start : half.q_end],
+                                    half.k,
+                                    half.v,
+                                    half.cu_seqlens_q,
+                                    half.cu_seqlens_k,
+                                    half.max_seqlen_q,
+                                    half.max_seqlen_k,
+                                    None,
+                                )
+                            )
+                        output = torch.cat(half_outputs, dim=0)
+                    else:
+                        output = _run_hcu_mla_varlen(
+                            q,
+                            k,
+                            v,
+                            cu_seqlens_q_cp,
+                            cu_seqlens_k_cp,
+                            max_seqlen_q_cp,
+                            max_seqlen_k_cp,
+                            _fa_out,
+                        )
+                    if (
+                        cp_varlen_mode == "local-q"
+                        and output.shape[0] < local_q_num_tokens
+                    ):
+                        output = torch.cat(
+                            [
+                                output,
+                                output.new_zeros(
+                                    local_q_num_tokens - output.shape[0],
+                                    *output.shape[1:],
+                                ),
+                            ],
+                            dim=0,
+                        )
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
                     lse = torch.transpose(lse, 0, 1).contiguous()
@@ -1664,7 +1792,6 @@ class FlashAttentionBackend(AttentionBackend):
                         not use_cascade_attn
                     ), "Cascade attention under MLA CP is not supported in v1."
                     q_fused = torch.cat([q_nope, q_rope], dim=-1)
-
                     def _mla_cp_attn(
                         q_chunk,
                         cu_seqlens_q_cp,
@@ -1673,7 +1800,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ):
                         q_nope_chunk = q_chunk[..., : layer.v_head_dim]
                         q_rope_chunk = q_chunk[..., layer.v_head_dim :]
-                        return flash_attn_with_kvcache(
+                        cp_output = flash_attn_with_kvcache(
                             q=q_rope_chunk,
                             qv=q_nope_chunk,
                             k_cache=k_rope_cache,
@@ -1692,6 +1819,13 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=fa_v_descale,
                             num_splits=self.num_splits,
                             ver=self.fa_impl_ver,
+                        )
+                        # HCU MLA returns a padded batched layout
+                        # [batch, max_seqlen_q, heads, v_dim], while the CP
+                        # strategy concatenates token-major prev/next halves.
+                        # Normalize both HCU and CUDA-style outputs here.
+                        return cp_output.view(
+                            -1, layer.tp_q_head_num, layer.v_head_dim
                         )
 
                     if is_cp_v2_active(forward_batch):
