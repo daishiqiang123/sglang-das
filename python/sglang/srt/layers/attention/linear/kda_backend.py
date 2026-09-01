@@ -9,14 +9,43 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_cp import (
+    forward_kda_affine_prefill_cp,
+    kda_use_prefill_cp,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hcu, is_npu
 from sglang.srt.utils.common import rank0_log
+
+
+def _trace_kda_cp_output(tag: str, layer, forward_batch, output: torch.Tensor) -> None:
+    """Log a natural-order KDA output fingerprint for CP A/B comparisons."""
+    if not get_bool_env_var("SGLANG_KIMI_CP_CORRECTNESS_TRACE"):
+        return
+    if not kda_use_prefill_cp(forward_batch):
+        return
+
+    strategy = get_cp_strategy()
+    if strategy is None:
+        return
+    local = output.squeeze(0) if output.ndim >= 4 else output
+    full = strategy.gather_hidden_states(local.contiguous(), forward_batch)
+    values = full.detach().float()
+    rank0_log(
+        f"KIMI_KDA_TRACE tag={tag} layer={getattr(layer, 'layer_id', 'unknown')} "
+        f"shape={tuple(values.shape)} sum={values.sum().item():.9e} "
+        f"abs_sum={values.abs().sum().item():.9e} "
+        f"sq_sum={values.square().sum().item():.9e} "
+        f"max_abs={values.abs().max().item() if values.numel() else 0.0:.9e} "
+        f"first={values.flatten()[0].item() if values.numel() else 0.0:.9e} "
+        f"last={values.flatten()[-1].item() if values.numel() else 0.0:.9e}"
+    )
 
 # HCU: use the operator-library causal_conv1d (DAS/DTK build) for the plain
 # extend/decode paths. The spec-decode verify path keeps the triton
@@ -478,6 +507,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        self._kda_cp_logged = False
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -683,7 +713,64 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
+        cp_reference_strategy = None
+        cp_reference_local_tokens = None
+        if kda_use_prefill_cp(forward_batch):
+            if not isinstance(mixed_qkv, torch.Tensor):
+                raise TypeError(
+                    "KDA affine PCP expects the packed mixed_qkv tensor, got "
+                    f"{type(mixed_qkv)!r}."
+                )
+            if is_hcu() and get_bool_env_var("SGLANG_HCU_KDA_CP_FULL_REFERENCE"):
+                cp_reference_strategy = get_cp_strategy()
+                assert cp_reference_strategy is not None
+                cp_reference_local_tokens = mixed_qkv.shape[0]
+                mixed_qkv = cp_reference_strategy.gather_hidden_states(
+                    mixed_qkv, forward_batch
+                )
+                a = cp_reference_strategy.gather_hidden_states(
+                    a.squeeze(0), forward_batch
+                ).unsqueeze(0)
+                b = cp_reference_strategy.gather_hidden_states(
+                    b.squeeze(0), forward_batch
+                ).unsqueeze(0)
+                if not self._kda_cp_logged:
+                    rank0_log(
+                        "KDA prefill CP correctness reference: full natural-order "
+                        "extend followed by zigzag output sharding"
+                    )
+                    self._kda_cp_logged = True
+            else:
+                if not self._kda_cp_logged:
+                    rank0_log(
+                        "KDA prefill CP backend: HCU Triton affine-state composition "
+                        "(zigzag, final-state-only)"
+                    )
+                    self._kda_cp_logged = True
+                core_attn_out = forward_kda_affine_prefill_cp(
+                    self,
+                    layer,
+                    forward_batch,
+                    mixed_qkv,
+                    a,
+                    b,
+                    causal_conv_fn=_run_causal_conv1d_fn,
+                )
+                _trace_kda_cp_output(
+                    "affine_output", layer, forward_batch, core_attn_out
+                )
+                return core_attn_out
+
         query_start_loc = self.forward_metadata.query_start_loc
+        if (
+            cp_reference_strategy is not None
+            and int(query_start_loc[-1].item()) != mixed_qkv.shape[0]
+        ):
+            raise RuntimeError(
+                "KDA CP full-reference query geometry mismatch: "
+                f"query_start_loc[-1]={int(query_start_loc[-1].item())}, "
+                f"tokens={mixed_qkv.shape[0]}."
+            )
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
@@ -791,6 +878,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 forward_batch, h, ssm_states, self.forward_metadata
             )
 
+        if cp_reference_strategy is not None:
+            assert cp_reference_local_tokens is not None
+            core_attn_out = cp_reference_strategy.shard_hidden_states(
+                core_attn_out.squeeze(0), forward_batch
+            )[:cp_reference_local_tokens].unsqueeze(0)
+            _trace_kda_cp_output(
+                "reference_output", layer, forward_batch, core_attn_out
+            )
         return core_attn_out
 
     def _forward_target_verify(

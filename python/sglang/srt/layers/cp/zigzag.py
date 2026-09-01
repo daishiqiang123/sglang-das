@@ -30,6 +30,7 @@ After all-gather, the blocks are reranged back to their original order:
 
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
@@ -54,6 +55,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_device, get_parallel
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -115,8 +119,16 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
+            # ScheduleBatch exposes the same unpadded request lengths under
+            # ``extend_lens``.  Accept both so DP-attention can decide PCP
+            # before it fabricates idle work or materializes padding.
+            extend_lens = getattr(forward_batch, "extend_lens", None)
+        if extend_lens is None:
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+        extend_lens = [int(length) for length in extend_lens]
+        return int(num_tokens) >= sum(extend_lens) and all(
+            length >= self.cp_size * 2 for length in extend_lens
+        )
 
     def build_metadata(
         self,
@@ -428,8 +440,15 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def materialize_full_mla_kv(
         self, forward_batch, layer: Any, k_nope: Any, k_rope: Any
     ) -> None:
-        kv_lora_rank = k_nope.shape[-1]
-        latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
+        if k_rope is None:
+            # HCU MLA's compatibility path already packs the latent as
+            # [k_nope | k_rope].  RadixAttention.v_head_dim is the MLA
+            # value/latent rank used by the KV pool split.
+            kv_lora_rank = layer.v_head_dim
+            latent = k_nope.contiguous()
+        else:
+            kv_lora_rank = k_nope.shape[-1]
+            latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
         latent_full = self.gather_kv_cache(latent, forward_batch)
         get_token_to_kv_pool().set_mla_kv_buffer(
             layer,
@@ -465,6 +484,21 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 *x.shape[1:],
                 device=x.device,
                 dtype=x.dtype,
+            )
+
+        # Keep the collective failure actionable.  This is especially useful
+        # for MLA PCP, where the expanded K/V tensor is the first CP tensor
+        # whose token geometry can diverge from the model hidden-state path.
+        group_world_size = group.world_size
+        expected_output_numel = group_world_size * x.numel()
+        if gathered.numel() != expected_output_numel:
+            raise ValueError(
+                "CP all-gather shape mismatch: "
+                f"strategy_cp_size={self.cp_size}, group_world_size={group_world_size}, "
+                f"cp_rank={self.cp_rank}, input_shape={tuple(x.shape)}, "
+                f"output_shape={tuple(gathered.shape)}, max_len={max_len}, "
+                f"local_len={local_len}, logical_tokens={per_rank_token}, "
+                f"physical_tokens={meta.per_rank_actual_token}."
             )
         group.all_gather_into_tensor(gathered, x)
 
