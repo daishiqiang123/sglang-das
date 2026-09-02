@@ -13,10 +13,14 @@ for the first performance measurement.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 import torch
 
+logger = logging.getLogger(__name__)
+_KDA_PCP_TRACE_EMITTED = False
+_KDA_PCP_TRACE_KEYS: set[tuple[int, int, int, int]] = set()
 _CHUNK_SIZE = 64
 
 
@@ -279,9 +283,24 @@ def run_kda_affine_prefill_cp(
     )
     from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 
+    global _KDA_PCP_TRACE_EMITTED
     metadata = forward_batch.attn_cp_metadata
     cp_size = get_parallel().attn_cp_size
     _validate_zigzag_metadata(metadata, cp_size)
+    parallel = get_parallel()
+    q_local_tokens = q.shape[1] if q.ndim >= 2 and q.shape[0] == 1 else q.shape[0]
+    if not _KDA_PCP_TRACE_EMITTED:
+        logger.info(
+            "KIMI_KDA_PCP_AFFINE active: cp_rank=%s, cp_size=%s, "
+            "local_tokens=%s, segment_count=%s, q_shape=%s, "
+            "compact_state_only=True",
+            parallel.attn_cp_rank,
+            cp_size,
+            q_local_tokens,
+            len(metadata.split_list),
+            tuple(q.shape),
+        )
+        _KDA_PCP_TRACE_EMITTED = True
     if q.shape != k.shape or q.shape[-2] != v.shape[-2]:
         raise NotImplementedError(
             "KDA affine PCP currently requires equal Q/K/V head counts; "
@@ -421,6 +440,38 @@ def forward_kda_affine_prefill_cp(
 ) -> torch.Tensor:
     """Full KDA CP forward, including CP-aware short convolution state."""
     metadata = backend.forward_metadata
+    from sglang.srt.utils import get_bool_env_var
+
+    parallel = get_parallel()
+    local_tokens = int(mixed_qkv.shape[0])
+    trace_key = (
+        int(getattr(forward_batch, "batch_size", 0) or 0),
+        int(getattr(forward_batch, "extend_num_tokens", 0) or 0),
+        local_tokens,
+        int(len(getattr(forward_batch.attn_cp_metadata, "split_list", ()) or ())),
+    )
+    if (
+        get_bool_env_var("SGLANG_KIMI_CP_TRACE", default="false")
+        and getattr(parallel, "attn_tp_rank", -1) == 0
+        and trace_key not in _KDA_PCP_TRACE_KEYS
+        and len(_KDA_PCP_TRACE_KEYS) < 128
+    ):
+        logger.info(
+            "KIMI_KDA_PCP_AFFINE_CALL: cp_rank=%s, layer_id=%s, "
+            "batch_size=%s, extend_num_tokens=%s, local_tokens=%s, "
+            "segment_count=%s, mixed_qkv_shape=%s, mixed_qkv_dtype=%s, "
+            "affine_state_exchange=True, full_token_activation_gather=False",
+            parallel.attn_cp_rank,
+            getattr(layer, "layer_id", None),
+            getattr(forward_batch, "batch_size", None),
+            getattr(forward_batch, "extend_num_tokens", None),
+            local_tokens,
+            trace_key[-1],
+            tuple(mixed_qkv.shape),
+            mixed_qkv.dtype,
+        )
+        _KDA_PCP_TRACE_KEYS.add(trace_key)
+
     if metadata.has_mamba_track_mask:
         raise NotImplementedError(
             "KDA affine PCP radix checkpoints are not enabled in the first HCU "
