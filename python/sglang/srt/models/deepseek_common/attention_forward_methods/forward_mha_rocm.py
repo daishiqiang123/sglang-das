@@ -13,6 +13,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.srt.layers.attention.mla_cp import (
+    hcu_mla_use_ring_prefill_cp,
+    select_mha_prefix_kv_indices,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -195,22 +199,27 @@ class DeepseekMHARocmForwardMixin:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        if (
-            is_cp_v2_active(forward_batch)
-            and mla_use_prefill_cp(forward_batch)
-        ):
-            # MHA_ONE_SHOT's core calls the backend with save_kv_cache=False,
-            # so the prepare phase owns the persistent MLA cache write.  Gather
-            # rank-local latent K/K-RoPE into natural order before writing it;
-            # writing the local shard directly through out_cache_loc would map
-            # zigzag rows onto the wrong global positions.
-            cp_strategy = get_cp_strategy()
-            assert cp_strategy is not None
-            cp_strategy.materialize_full_mla_kv(
-                forward_batch,
-                self.attn_mha,
-                kv_a.unsqueeze(1),
-                k_pe,
+        # Kimi-K3 HCU PCP debug fix: the varlen path supports the projected
+        # BF16 Q with FP8 K/V representation used by this launch configuration.
+        # The previous FP8 guard silently selected expanded-K/V all-gather, so CP was not a
+        # compact-latent ring implementation.
+        # Original bring-up restriction (disabled for this validation):
+        #            and self.kv_cache_dtype != "fp8_e4m3"
+        use_hcu_mla_cp_ring = bool(
+            hcu_mla_use_ring_prefill_cp(forward_batch)
+        )
+        forward_batch.mla_cp_hcu_ring_active = use_hcu_mla_cp_ring
+        if use_hcu_mla_cp_ring:
+            # Keep only the rank-local compact MLA representation.  The HCU
+            # attention backend rotates this latent K + K-RoPE shard, expands
+            # one source rank at a time and writes every received shard to its
+            # natural persistent-cache locations.
+            forward_batch.mla_cp_local_k = kv_a.unsqueeze(1)
+            forward_batch.mla_cp_local_k_rope = k_pe
+        elif is_cp_v2_active(forward_batch) and mla_use_prefill_cp(forward_batch):
+            raise RuntimeError(
+                "HCU MLA prefill CP requires compact-ring; refusing the legacy "
+                "full latent-KV materialization path."
             )
         else:
             self._set_mla_kv_buffer_rocm(latent_cache, kv_a, k_pe, forward_batch)
@@ -242,6 +251,23 @@ class DeepseekMHARocmForwardMixin:
                         kv_a,
                         k_pe,
                     )
+                elif use_hcu_mla_cp_ring:
+                    prefix_lens = [
+                        int(length)
+                        for length in forward_batch.extend_prefix_lens_cpu
+                    ]
+                    prefix_indices = select_mha_prefix_kv_indices(
+                        forward_batch.fetch_mha_one_shot_kv_indices(),
+                        [int(length) for length in forward_batch.seq_lens_cpu],
+                        prefix_lens,
+                    )
+                    prefix_k, prefix_k_rope = self._get_mla_kv_buffer_rocm(
+                        prefix_indices,
+                        q.dtype,
+                        forward_batch,
+                    )
+                    forward_batch.mla_cp_prefix_k = prefix_k.unsqueeze(1)
+                    forward_batch.mla_cp_prefix_k_rope = prefix_k_rope
                 else:
                     kv_a, k_pe = self._get_mla_kv_buffer_rocm(
                         forward_batch.fetch_mha_one_shot_kv_indices(),

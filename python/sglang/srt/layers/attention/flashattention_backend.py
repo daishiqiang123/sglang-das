@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -18,9 +19,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.mla_cp import (
-    build_hcu_mla_cp_varlen_halves,
-)
+from sglang.srt.layers.attention.mla_cp import run_hcu_mla_cp_ring
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -1567,8 +1566,8 @@ class FlashAttentionBackend(AttentionBackend):
                     and forward_batch.attn_attend_prefix_cache
                 ):
                     raise NotImplementedError(
-                        "HCU MLA local-Q varlen PCP does not yet support "
-                        "chunked prefix-cache attention. Run the initial "
+                        "HCU MLA compact-ring PCP does not yet support "
+                        "chunked prefix-cache attention. Run "
                         "validation with --disable-radix-cache."
                     )
                 # Do multi-head attention with chunked prefix cache
@@ -1601,28 +1600,22 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
                     cp_varlen_mode = None
-                    cp_varlen_halves = None
                     local_q_num_tokens = q.shape[0]
                     if _is_hcu and is_cp_v2_active(forward_batch):
-                        # True HCU MLA PCP: keep rank-local zigzag Q, gather only
-                        # natural-order K/V, and pack the causal KV prefix needed
-                        # by each local prev/next query block.
-                        cp_strategy = get_cp_strategy()
-                        assert cp_strategy is not None
+                        use_compact_ring = bool(
+                            getattr(
+                                forward_batch,
+                                "mla_cp_hcu_ring_active",
+                                False,
+                            )
+                        )
                         assert not forward_batch.mha_return_lse
-                        full_k = cp_strategy.gather_hidden_states(
-                            k.contiguous().view(
-                                -1, layer.tp_k_head_num, layer.head_dim
-                            ),
-                            forward_batch,
+                        k = k.contiguous().view(
+                            -1, layer.tp_k_head_num, layer.head_dim
                         )
-                        full_v = cp_strategy.gather_hidden_states(
-                            v.contiguous().view(
-                                -1, layer.tp_k_head_num, layer.v_head_dim
-                            ),
-                            forward_batch,
+                        v = v.contiguous().view(
+                            -1, layer.tp_k_head_num, layer.v_head_dim
                         )
-                        cp_varlen_mode = "local-q"
                         cp_meta = forward_batch.attn_cp_metadata
                         logical_q_tokens = (
                             cp_meta.total_q_prev_tokens
@@ -1631,12 +1624,13 @@ class FlashAttentionBackend(AttentionBackend):
                         q = q.contiguous().view(
                             -1, layer.tp_q_head_num, layer.head_dim
                         )[:logical_q_tokens]
-                        cp_varlen_halves = build_hcu_mla_cp_varlen_halves(
-                            full_k,
-                            full_v,
-                            forward_batch,
-                            cp_size=get_parallel().attn_cp_size,
-                        )
+                        if not use_compact_ring:
+                            raise RuntimeError(
+                                "HCU MLA prefill CP requires compact-ring; "
+                                "the legacy expanded full-KV/local-Q path "
+                                "has been removed."
+                            )
+                        cp_varlen_mode = "compact-ring"
                     else:
                         cu_seqlens_q_cp = metadata.cu_seqlens_q
                         cu_seqlens_k_cp = (
@@ -1659,6 +1653,9 @@ class FlashAttentionBackend(AttentionBackend):
                         max_seqlen_q_arg,
                         max_seqlen_k_arg,
                         out_arg,
+                        *,
+                        causal_arg=True,
+                        return_lse_arg=None,
                     ):
                         # FlashAttention's varlen interface requires both
                         # cumulative-length tensors to be int32.
@@ -1693,33 +1690,64 @@ class FlashAttentionBackend(AttentionBackend):
                             max_seqlen_q=max_seqlen_q_arg,
                             max_seqlen_k=max_seqlen_k_arg,
                             softmax_scale=layer.scaling,
-                            causal=True,
+                            causal=causal_arg,
                             k_descale=fa_k_descale,
                             v_descale=fa_v_descale,
-                            return_softmax_lse=forward_batch.mha_return_lse,
+                            return_softmax_lse=(
+                                forward_batch.mha_return_lse
+                                if return_lse_arg is None
+                                else return_lse_arg
+                            ),
                             out=out_arg,
                             ver=self.fa_impl_ver,
                             **kwargs,
                         )
 
-                    if cp_varlen_mode == "local-q":
-                        half_outputs = []
-                        for half in cp_varlen_halves:
-                            if half.q_start == half.q_end:
-                                continue
-                            half_outputs.append(
-                                _run_hcu_mla_varlen(
-                                    q[half.q_start : half.q_end],
-                                    half.k,
-                                    half.v,
-                                    half.cu_seqlens_q,
-                                    half.cu_seqlens_k,
-                                    half.max_seqlen_q,
-                                    half.max_seqlen_k,
-                                    None,
-                                )
+                    if cp_varlen_mode == "compact-ring":
+                        def _run_ring_segment(
+                            q_part,
+                            k_part,
+                            v_part,
+                            q_lens,
+                            kv_lens,
+                            *,
+                            causal,
+                        ):
+                            cu_q = torch.tensor(
+                                [0, *accumulate(q_lens)],
+                                device=q_part.device,
+                                dtype=torch.int32,
                             )
-                        output = torch.cat(half_outputs, dim=0)
+                            cu_k = torch.tensor(
+                                [0, *accumulate(kv_lens)],
+                                device=k_part.device,
+                                dtype=torch.int32,
+                            )
+                            result = _run_hcu_mla_varlen(
+                                q_part,
+                                k_part,
+                                v_part,
+                                cu_q,
+                                cu_k,
+                                max(q_lens, default=0),
+                                max(kv_lens, default=0),
+                                None,
+                                causal_arg=causal,
+                                return_lse_arg=True,
+                            )
+                            segment_output, segment_lse, *_ = result
+                            return segment_output, segment_lse.T.contiguous()
+
+                        output = run_hcu_mla_cp_ring(
+                            q,
+                            k,
+                            v,
+                            forward_batch,
+                            layer,
+                            self.token_to_kv_pool,
+                            run_segment=_run_ring_segment,
+                            merge_segment=merge_state_v2_wrapper,
+                        )
                     else:
                         output = _run_hcu_mla_varlen(
                             q,
@@ -1732,7 +1760,7 @@ class FlashAttentionBackend(AttentionBackend):
                             _fa_out,
                         )
                     if (
-                        cp_varlen_mode == "local-q"
+                        cp_varlen_mode == "compact-ring"
                         and output.shape[0] < local_q_num_tokens
                     ):
                         output = torch.cat(
