@@ -9,6 +9,10 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_cp import (
+    forward_kda_affine_prefill_cp,
+    kda_use_prefill_cp,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -17,6 +21,7 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hcu, is_npu
 from sglang.srt.utils.common import rank0_log
+
 
 # HCU: use the operator-library causal_conv1d (DAS/DTK build) for the plain
 # extend/decode paths. The spec-decode verify path keeps the triton
@@ -682,6 +687,22 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # per-step state checkpointing + central rollback; handled separately.
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+
+        if kda_use_prefill_cp(forward_batch):
+            if not isinstance(mixed_qkv, torch.Tensor):
+                raise TypeError(
+                    "KDA affine PCP expects the packed mixed_qkv tensor, got "
+                    f"{type(mixed_qkv)!r}."
+                )
+            return forward_kda_affine_prefill_cp(
+                self,
+                layer,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+                causal_conv_fn=_run_causal_conv1d_fn,
+            )
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
