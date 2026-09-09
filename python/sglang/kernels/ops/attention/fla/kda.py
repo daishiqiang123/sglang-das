@@ -1146,10 +1146,11 @@ def chunk_kda_fwd(
     )
 
     if A_log is not None:
-        if _USE_KDA_HCU:
-            # boltops fused gate activation + chunk-local cumsum (also computes
-            # beta, which we ignore: downstream keeps the model's post-sigmoid
-            # beta).
+        if _USE_KDA_HCU and lower_bound is not None:
+            # boltops fused gate activation + chunk-local cumsum is used only
+            # for the bounded-gate contract. The unbounded gate path must use
+            # the Triton reference; the HCU A/B otherwise corrupts greedy
+            # tokens when FlashKDA falls back from ordinary prefill.
             g = fused_kda_gate_chunk_cumsum_hcu(
                 g,
                 beta,
