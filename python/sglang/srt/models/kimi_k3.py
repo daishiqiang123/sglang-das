@@ -136,8 +136,6 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
-
-
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -366,9 +364,6 @@ class KimiK3MLP(nn.Module):
         # given); the shared-experts instance inside KimiK3MoE passes None and
         # runs on the already-gathered buffer.
         use_cp = forward_batch is not None and is_cp_v2_active(forward_batch)
-        # The dense MLP is sharded across the full TP group. CP ranks own
-        # different token rows, so materialize natural token order before its
-        # full-TP collectives and restore the local zigzag shard afterwards.
         if use_cp:
             hidden_states = cp_materialize_global_token_order(
                 hidden_states, forward_batch
@@ -1292,6 +1287,7 @@ class KimiK3MoE(nn.Module):
         *,
         prefix_sum: Optional[torch.Tensor] = None,
         forward_batch: Optional[ForwardBatch] = None,
+        sp_sharded_input: bool = False,
     ) -> torch.Tensor:
         """A pending prefix_sum is always consumed here: folded into the
         3-way JIT tail add when covered, plain adds otherwise (bit-identical
@@ -1309,8 +1305,84 @@ class KimiK3MoE(nn.Module):
         every rank (tp-fold redundant compute + a2a traffic)."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        use_cp = forward_batch is not None and is_cp_v2_active(forward_batch)
-        if use_cp:
+        # PERF/BUGFIX 20260902: SP-MoE has already reduce-scattered this
+        # layer's local contiguous rows.  EP dispatch consumes those rows
+        # directly; treating them as CP zigzag rows would request a second
+        # (and invalid) CP all-gather with the pre-scatter token count.
+        # Keep the original CP path for the ordinary (non-SP) MoE call.
+        use_cp = (
+            forward_batch is not None
+            and is_cp_v2_active(forward_batch)
+            and not sp_sharded_input
+        )
+        # In the TP8/CP8/EP8 layout attention-TP is one, so CP ranks own
+        # disjoint token rows.  Feed those rows directly to DeepEP instead of
+        # materializing and replicating the full sequence on all EP ranks.
+        # DeepEP NORMAL dispatch accepts a different source-row count on each
+        # rank; its get_dispatch_layout() derives the per-rank send counts from
+        # each rank's top-k matrix.  Do not equalize CP slabs here: synthetic
+        # zero rows would still be routed and would add needless MoE work/A2A.
+        parallel = get_parallel()
+        cp_size = parallel.attn_cp_size
+        cp_ep_local = (
+            use_cp
+            and self._ep_a2a
+            and parallel.attn_tp_size == 1
+            # Local CP rows are mathematically safe only when the EP group is
+            # the same one-rank-per-token-owner topology (EP=CP, no MoE TP).
+            # Note: parallel.moe_dp_size may expose the effective CP-backed
+            # group when configured MoE-DP is smaller than CP; it must not be
+            # used as a direct-mode exclusion here.
+            and parallel.moe_ep_size == cp_size
+            and parallel.moe_tp_size == 1
+        )
+        if cp_ep_local:
+            metadata = forward_batch.attn_cp_metadata
+            # `per_rank_actual_token` is the post-padding physical length.  It
+            # must never silently substitute for the logical length: doing so
+            # would route CP's synthetic zero rows through the MoE.  The CP-v2
+            # metadata builder always records both fields before model forward.
+            logical_tokens = metadata.per_rank_logical_token
+            physical_tokens = metadata.per_rank_actual_token
+            cp_rank = parallel.attn_cp_rank
+            if logical_tokens is None or len(logical_tokens) != cp_size:
+                raise ValueError(
+                    "CP local MoE requires per_rank_logical_token for every CP rank: "
+                    f"logical_tokens={logical_tokens!r}, cp_size={cp_size}."
+                )
+            if physical_tokens is None or len(physical_tokens) != cp_size:
+                raise ValueError(
+                    "CP local MoE requires per_rank_actual_token for every CP rank: "
+                    f"physical_tokens={physical_tokens!r}, cp_size={cp_size}."
+                )
+            local_logical_rows = int(logical_tokens[cp_rank])
+            local_physical_rows = int(physical_tokens[cp_rank])
+            if (
+                local_logical_rows < 0
+                or local_logical_rows > local_physical_rows
+                or local_physical_rows != num_tokens
+            ):
+                raise ValueError(
+                    "CP local MoE metadata does not match the local physical slab: "
+                    f"logical_rows={local_logical_rows}, physical_rows={local_physical_rows}, "
+                    f"hidden_rows={num_tokens}, cp_rank={cp_rank}, "
+                    f"per_rank_logical={logical_tokens}, per_rank_actual={physical_tokens}."
+                )
+            hidden_states = hidden_states[:local_logical_rows]
+            if prefix_sum is not None:
+                if (
+                    prefix_sum.ndim != 2
+                    or prefix_sum.shape[1] != hidden_size
+                    or prefix_sum.shape[0] != local_physical_rows
+                ):
+                    raise ValueError(
+                        "CP local MoE prefix_sum must use the same physical local row layout: "
+                        f"prefix_shape={tuple(prefix_sum.shape)}, "
+                        f"expected=({local_physical_rows}, {hidden_size})."
+                    )
+                prefix_sum = prefix_sum[:local_logical_rows]
+        cp_prefix_sum = None
+        if use_cp and not cp_ep_local:
             hidden_states = cp_materialize_global_token_order(
                 hidden_states, forward_batch
             )
@@ -1336,6 +1408,24 @@ class KimiK3MoE(nn.Module):
             dp_scatter(out, global_out, forward_batch)
             if dp_prefix_sum is not None:
                 out = out + dp_prefix_sum
+        elif cp_ep_local:
+            if out.shape[0] < local_logical_rows:
+                raise ValueError(
+                    "CP local MoE returned fewer rows than its logical input: "
+                    f"output_rows={out.shape[0]}, logical_rows={local_logical_rows}."
+                )
+            out = out[:local_logical_rows]
+            physical_pad_rows = local_physical_rows - local_logical_rows
+            if physical_pad_rows:
+                # Restore only CP's pre-existing physical alignment padding;
+                # never feed these synthetic rows through the router/DeepEP.
+                out = torch.cat(
+                    [
+                        out,
+                        out.new_zeros((physical_pad_rows, hidden_size)),
+                    ],
+                    dim=0,
+                )
         elif use_cp:
             out = cp_shard_hidden_states(out, forward_batch)
             if cp_prefix_sum is not None:
@@ -2500,9 +2590,19 @@ class KimiK3DecoderLayer(nn.Module):
             )
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
-        )
+        if self._sp_moe and shard_lo >= 0:
+            # The input is the TP reduce-scattered local row shard.  KimiK3MoE
+            # must not materialize CP order or shard its output a second time.
+            out = self.mlp(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                forward_batch=forward_batch,
+                sp_sharded_input=True,
+            )
+        else:
+            out = self.mlp(
+                hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            )
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True

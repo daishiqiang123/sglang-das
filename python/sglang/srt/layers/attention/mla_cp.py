@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import Any, Callable, Optional
 
 import torch
-
-logger = logging.getLogger(__name__)
-_HCU_MLA_RING_TRACE_EMITTED = False
-_HCU_MLA_RING_TRACE_KEYS: set[tuple[int, int, int, int]] = set()
 
 
 @dataclass(frozen=True)
@@ -22,7 +17,6 @@ class HCUMLACPRingSourceLayout:
     early_token_count: int
     early_lens: tuple[int, ...]
     late_lens: tuple[int, ...]
-
 
 def hcu_mla_use_ring_prefill_cp(forward_batch: Any) -> bool:
     """Whether the HCU compact-latent MLA ring can own this prefill.
@@ -58,7 +52,6 @@ def hcu_mla_use_ring_prefill_cp(forward_batch: Any) -> bool:
         and not bool(getattr(forward_batch, "attn_attend_prefix_cache", False))
     )
 
-
 def select_mha_prefix_kv_indices(
     kv_indices: torch.Tensor,
     seq_lens: list[int],
@@ -91,11 +84,9 @@ def select_mha_prefix_kv_indices(
         return kv_indices.new_empty((0,))
     return selected[0] if len(selected) == 1 else torch.cat(selected)
 
-
 def get_zigzag_mla_cp_ring_visibility(cp_rank: int, source_rank: int):
     """Return early->early, early->late and late->late visibility."""
     return source_rank <= cp_rank, True, source_rank >= cp_rank
-
 
 def get_zigzag_cp_rank_chunk_indices(
     batch_size: int, cp_size: int, cp_rank: int
@@ -109,7 +100,6 @@ def get_zigzag_cp_rank_chunk_indices(
     return list(range(cp_rank, batch_size * segments, segments)) + list(
         range(segments - cp_rank - 1, batch_size * segments, segments)
     )
-
 
 def build_hcu_mla_cp_ring_source_layouts(
     metadata: Any, *, cp_size: int
@@ -143,7 +133,6 @@ def build_hcu_mla_cp_ring_source_layouts(
         )
     return tuple(layouts)
 
-
 def build_hcu_mla_cp_ring_cache_locs(
     cache_locs: torch.Tensor, metadata: Any, *, cp_size: int
 ) -> tuple[torch.Tensor, ...]:
@@ -171,7 +160,6 @@ def build_hcu_mla_cp_ring_cache_locs(
         for source_rank in range(cp_size)
     )
 
-
 def run_hcu_mla_cp_ring(
     q: torch.Tensor,
     local_k: torch.Tensor,
@@ -194,8 +182,6 @@ def run_hcu_mla_cp_ring(
     before its visible attention rectangles are computed.  No full expanded
     K/V tensor is staged on a rank.
     """
-    global _HCU_MLA_RING_TRACE_EMITTED
-
     metadata = forward_batch.attn_cp_metadata
     from sglang.srt.runtime_context import get_parallel
 
@@ -232,59 +218,7 @@ def run_hcu_mla_cp_ring(
     latent_width = local_latent.shape[1] * local_latent.shape[2]
     rope_width = local_rope.shape[1] * local_rope.shape[2]
     max_rank_tokens = max(layout.token_count for layout in layouts)
-    if not _HCU_MLA_RING_TRACE_EMITTED:
-        logger.info(
-            "KIMI_MLA_PCP_RING active: cp_rank=%s, cp_size=%s, "
-            "local_q_tokens=%s, local_compact_kv_tokens=%s, "
-            "max_ring_payload_tokens=%s, prefix_tokens=%s; "
-            "Q remains local and only compact latent KV is rotated",
-            cp_rank,
-            cp_size,
-            logical_q_tokens,
-            local_layout.token_count,
-            max_rank_tokens,
-            sum(int(x) for x in forward_batch.extend_prefix_lens_cpu),
-        )
-        _HCU_MLA_RING_TRACE_EMITTED = True
 
-    # Bounded per-forward evidence: one line for the first few MLA layers on
-    # each CP rank's attention-TP leader. This distinguishes GSM8K requests
-    # from the startup warmup without printing prompts or output tokens.
-    from sglang.srt.utils import get_bool_env_var
-
-    if (
-        get_bool_env_var("SGLANG_KIMI_CP_TRACE", default="false")
-        and getattr(parallel, "attn_tp_rank", -1) == 0
-    ):
-        trace_key = (
-            int(getattr(forward_batch, "batch_size", 0) or 0),
-            int(getattr(forward_batch, "extend_num_tokens", 0) or 0),
-            int(logical_q_tokens),
-            int(local_layout.token_count),
-        )
-        if trace_key not in _HCU_MLA_RING_TRACE_KEYS and len(_HCU_MLA_RING_TRACE_KEYS) < 128:
-            logger.info(
-                "KIMI_MLA_PCP_RING_CALL: cp_rank=%s, layer_id=%s, "
-                "batch_size=%s, extend_num_tokens=%s, local_q_tokens=%s, "
-                "local_compact_kv_tokens=%s, max_ring_payload_tokens=%s, "
-                "q_shape=%s, q_dtype=%s, compact_dtype=%s, local_k_shape=%s, "
-                "local_v_shape=%s, ring_steps=%s, "
-                "full_expanded_kv_materialized=False",
-                cp_rank,
-                getattr(layer, "layer_id", None),
-                getattr(forward_batch, "batch_size", None),
-                getattr(forward_batch, "extend_num_tokens", None),
-                logical_q_tokens,
-                local_layout.token_count,
-                max_rank_tokens,
-                tuple(q.shape),
-                q.dtype,
-                local_latent.dtype,
-                tuple(local_k.shape),
-                tuple(local_v.shape),
-                cp_size,
-            )
-            _HCU_MLA_RING_TRACE_KEYS.add(trace_key)
 
     packed = local_latent.new_zeros((max_rank_tokens, latent_width + rope_width))
     packed[: local_layout.token_count, :latent_width].copy_(local_latent.flatten(1))
@@ -332,6 +266,92 @@ def run_hcu_mla_cp_ring(
             return new_output, new_lse
         return merge_segment(old_output, old_lse, new_output, new_lse)
 
+    def merge_state(
+        old_output: Optional[torch.Tensor],
+        old_lse: Optional[torch.Tensor],
+        new_output: torch.Tensor,
+        new_lse: torch.Tensor,
+    ):
+        """Merge one already-computed rectangle without launching FA again."""
+        if old_output is None:
+            return new_output, new_lse
+        return merge_segment(old_output, old_lse, new_output, new_lse)
+
+    packed_query_cache = None
+
+    def pack_query_halves():
+        """Interleave q_prev/q_next per request for one varlen FA batch."""
+        nonlocal packed_query_cache
+        if packed_query_cache is not None:
+            return packed_query_cache
+        parts = []
+        prev_start = next_start = 0
+        for prev_len, next_len in zip(local_prev_lens, local_next_lens):
+            prev_end = prev_start + int(prev_len)
+            next_end = next_start + int(next_len)
+            parts.extend(
+                (q_prev[prev_start:prev_end], q_next[next_start:next_end])
+            )
+            prev_start, next_start = prev_end, next_end
+        if not parts:
+            packed_query_cache = q_prev.new_empty((0, *q_prev.shape[1:]))
+        else:
+            packed_query_cache = torch.cat(parts, dim=0)
+        return packed_query_cache
+
+    def pack_source_halves(
+        early_part: torch.Tensor,
+        late_part: torch.Tensor,
+        early_lens: tuple[int, ...],
+        late_lens: tuple[int, ...],
+    ):
+        """Interleave a source's early/late slabs per request."""
+        parts = []
+        early_start = late_start = 0
+        for early_len, late_len in zip(early_lens, late_lens):
+            early_end = early_start + int(early_len)
+            late_end = late_start + int(late_len)
+            parts.extend((early_part[early_start:early_end], late_part[late_start:late_end]))
+            early_start, late_start = early_end, late_end
+        if not parts:
+            return early_part.new_empty((0, *early_part.shape[1:]))
+        return torch.cat(parts, dim=0)
+
+    def split_query_halves(
+        packed_part: torch.Tensor,
+        prev_lens: tuple[int, ...],
+        next_lens: tuple[int, ...],
+    ):
+        """Undo per-request query packing while preserving the legacy layout."""
+        prev_parts = []
+        next_parts = []
+        packed_start = 0
+        for prev_len, next_len in zip(prev_lens, next_lens):
+            prev_end = packed_start + int(prev_len)
+            next_end = prev_end + int(next_len)
+            prev_parts.append(packed_part[packed_start:prev_end])
+            next_parts.append(packed_part[prev_end:next_end])
+            packed_start = next_end
+        if not prev_parts:
+            empty = packed_part.new_empty((0, *packed_part.shape[1:]))
+            return empty, empty
+        return torch.cat(prev_parts, dim=0), torch.cat(next_parts, dim=0)
+
+    packed_rectangles = cp_size > 1
+
+    def store_source_cache(
+        source_rank: int,
+        source_latent: torch.Tensor,
+        source_rope: torch.Tensor,
+        source_layout: HCUMLACPRingSourceLayout,
+    ):
+        source_cache_locs = cache_locs_by_rank[source_rank]
+        if source_cache_locs.shape[0] != source_layout.token_count:
+            raise ValueError("HCU MLA CP ring cache/source token lengths differ.")
+        token_to_kv_pool.set_mla_kv_buffer(
+            layer, source_cache_locs, source_latent, source_rope
+        )
+
     for ring_step in range(cp_size):
         recv_packed = requests = None
         if ring_step + 1 < cp_size:
@@ -366,17 +386,149 @@ def run_hcu_mla_cp_ring(
         source_rope = source_payload[:, latent_width:].reshape(
             source_layout.token_count, local_rope.shape[1], local_rope.shape[2]
         )
+        early_end = source_layout.early_token_count
         if ring_step == 0:
             source_k, source_v = local_k, local_v
         else:
             source_k, source_v = expand_compact(source_latent, source_rope)
-
-        early_end = source_layout.early_token_count
         early_k, late_k = source_k[:early_end], source_k[early_end:]
         early_v, late_v = source_v[:early_end], source_v[early_end:]
         early_to_prev, early_to_next, late_to_next = (
             get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
         )
+
+        if packed_rectangles:
+            # For the local source, q_prev followed by q_next and early_k
+            # followed by late_k form one equal-length causal sequence.  A
+            # causal FA call therefore exactly covers the old three calls:
+            # q_prev->early (causal), q_next->early (non-causal), and
+            # q_next->late (causal).
+            if source_rank == cp_rank:
+                packed_q = pack_query_halves()
+                packed_k = pack_source_halves(
+                    early_k,
+                    late_k,
+                    source_layout.early_lens,
+                    source_layout.late_lens,
+                )
+                packed_lens = tuple(
+                    int(prev_len) + int(next_len)
+                    for prev_len, next_len in zip(
+                        local_prev_lens, local_next_lens
+                    )
+                )
+                packed_k_lens = tuple(
+                    int(early_len) + int(late_len)
+                    for early_len, late_len in zip(
+                        source_layout.early_lens,
+                        source_layout.late_lens,
+                    )
+                )
+                if packed_lens != packed_k_lens:
+                    raise ValueError(
+                        "HCU MLA packed local geometry mismatch: "
+                        f"q={packed_lens}, kv={packed_k_lens}."
+                    )
+                packed_output, packed_lse = run_segment(
+                    packed_q,
+                    packed_k,
+                    pack_source_halves(
+                        early_v,
+                        late_v,
+                        source_layout.early_lens,
+                        source_layout.late_lens,
+                    ),
+                    list(packed_lens),
+                    list(packed_k_lens),
+                    causal=True,
+                )
+                new_prev, new_next = split_query_halves(
+                    packed_output, local_prev_lens, local_next_lens
+                )
+                new_prev_lse, new_next_lse = split_query_halves(
+                    packed_lse, local_prev_lens, local_next_lens
+                )
+                output_prev, lse_prev = merge_state(
+                    output_prev, lse_prev, new_prev, new_prev_lse
+                )
+                output_next, lse_next = merge_state(
+                    output_next, lse_next, new_next, new_next_lse
+                )
+            elif source_rank < cp_rank:
+                # This source's early slab is non-causal for both query
+                # halves.  Pack the two query halves per request while keeping
+                # the single compact source expanded only once.
+                packed_q = pack_query_halves()
+                packed_lens = tuple(
+                    int(prev_len) + int(next_len)
+                    for prev_len, next_len in zip(
+                        local_prev_lens, local_next_lens
+                    )
+                )
+                packed_output, packed_lse = run_segment(
+                    packed_q,
+                    early_k,
+                    early_v,
+                    list(packed_lens),
+                    list(source_layout.early_lens),
+                    causal=False,
+                )
+                new_prev, new_next = split_query_halves(
+                    packed_output, local_prev_lens, local_next_lens
+                )
+                new_prev_lse, new_next_lse = split_query_halves(
+                    packed_lse, local_prev_lens, local_next_lens
+                )
+                output_prev, lse_prev = merge_state(
+                    output_prev, lse_prev, new_prev, new_prev_lse
+                )
+                output_next, lse_next = merge_state(
+                    output_next, lse_next, new_next, new_next_lse
+                )
+            else:
+                # A later source is visible only to q_next, and its early and
+                # late slabs share the same non-causal horizon.
+                packed_k = pack_source_halves(
+                    early_k,
+                    late_k,
+                    source_layout.early_lens,
+                    source_layout.late_lens,
+                )
+                packed_v = pack_source_halves(
+                    early_v,
+                    late_v,
+                    source_layout.early_lens,
+                    source_layout.late_lens,
+                )
+                packed_k_lens = tuple(
+                    int(early_len) + int(late_len)
+                    for early_len, late_len in zip(
+                        source_layout.early_lens,
+                        source_layout.late_lens,
+                    )
+                )
+                new_next, new_next_lse = run_segment(
+                    q_next,
+                    packed_k,
+                    packed_v,
+                    list(local_next_lens),
+                    list(packed_k_lens),
+                    causal=False,
+                )
+                output_next, lse_next = merge_state(
+                    output_next, lse_next, new_next, new_next_lse
+                )
+
+            store_source_cache(
+                source_rank, source_latent, source_rope, source_layout
+            )
+
+            if requests is not None:
+                for request in requests:
+                    request.wait()
+                packed = recv_packed
+            continue
+
         if early_to_prev:
             output_prev, lse_prev = accumulate_state(
                 output_prev,
@@ -411,11 +563,8 @@ def run_hcu_mla_cp_ring(
                 causal=source_rank == cp_rank,
             )
 
-        source_cache_locs = cache_locs_by_rank[source_rank]
-        if source_cache_locs.shape[0] != source_layout.token_count:
-            raise ValueError("HCU MLA CP ring cache/source token lengths differ.")
-        token_to_kv_pool.set_mla_kv_buffer(
-            layer, source_cache_locs, source_latent, source_rope
+        store_source_cache(
+            source_rank, source_latent, source_rope, source_layout
         )
 
         if requests is not None:
@@ -480,8 +629,8 @@ def run_hcu_mla_cp_ring(
     ):
         if hasattr(forward_batch, name):
             delattr(forward_batch, name)
-    return torch.cat((output_prev, output_next), dim=0)
 
+    return torch.cat((output_prev, output_next), dim=0)
 
 __all__ = [
     "HCUMLACPRingSourceLayout",
