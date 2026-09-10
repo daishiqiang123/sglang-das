@@ -284,9 +284,11 @@ def _apply_kda_cp_affine_block(
     h1,
     owner_rank,
     source_segment,
+    i_b,
     i_h,
     i_v,
     H: tl.constexpr,
+    B: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
@@ -294,7 +296,8 @@ def _apply_kda_cp_affine_block(
 ):
     """Apply one execution-plan affine transform to a state tile."""
     affine = gathered + (
-        ((owner_rank * MAX_SEGMENTS + source_segment) * H + i_h) * K * (V + K)
+        (((owner_rank * MAX_SEGMENTS + source_segment) * B + i_b) * H + i_h)
+        * K * (V + K)
     ).to(tl.int64)
 
     add0 = _load_kda_cp_row_tile(
@@ -329,14 +332,16 @@ def _store_kda_cp_state_tile(
     h0,
     h1,
     local_index: tl.constexpr,
+    i_b,
     i_h,
     i_v,
     H: tl.constexpr,
     K: tl.constexpr,
+    B: tl.constexpr,
     V: tl.constexpr,
     BV: tl.constexpr,
 ):
-    target += ((local_index * H + i_h) * K * V).to(tl.int64)
+    target += (((local_index * B + i_b) * H + i_h) * K * V).to(tl.int64)
     _store_kda_cp_row_tile(
         target, h0, i_v * BV, 0, K=K, C=V, ROW_STRIDE=V, BC=BV
     )
@@ -358,6 +363,7 @@ def merge_kda_cp_affine_states_kernel(
     source_segments,
     H: tl.constexpr,
     K: tl.constexpr,
+    B: tl.constexpr,
     V: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
     NUM_STEPS: tl.constexpr,
@@ -367,9 +373,11 @@ def merge_kda_cp_affine_states_kernel(
     LOCAL_STEP_2: tl.constexpr,
     BV: tl.constexpr,
 ):
-    """Fuse plan-driven affine composition for the batch-one hot path."""
-    i_v, i_h = tl.program_id(0), tl.program_id(1)
-    initial_state += (i_h * K * V).to(tl.int64)
+    """Fuse plan-driven affine composition across batch and CP segments."""
+    i_v, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+    initial_state += ((i_b * H + i_h) * K * V).to(tl.int64)
 
     h0 = _load_kda_cp_row_tile(
         initial_state, i_v * BV, 0, K=K, C=V, ROW_STRIDE=V, BC=BV
@@ -395,8 +403,10 @@ def merge_kda_cp_affine_states_kernel(
                 h0,
                 h1,
                 local_index,
+                i_b,
                 i_h,
                 i_v,
+                B=B,
                 H=H,
                 K=K,
                 V=V,
@@ -409,8 +419,10 @@ def merge_kda_cp_affine_states_kernel(
             h1,
             owner_rank,
             source_segment,
+            i_b,
             i_h,
             i_v,
+            B=B,
             H=H,
             K=K,
             V=V,
@@ -423,8 +435,10 @@ def merge_kda_cp_affine_states_kernel(
                 h0,
                 h1,
                 0,
+                i_b,
                 i_h,
                 i_v,
+                B=B,
                 H=H,
                 K=K,
                 V=V,
@@ -435,8 +449,10 @@ def merge_kda_cp_affine_states_kernel(
         h0,
         h1,
         0,
+        i_b,
         i_h,
         i_v,
+        B=B,
         H=H,
         K=K,
         V=V,
@@ -458,42 +474,54 @@ def merge_kda_cp_affine_states(
     tracked_state: torch.Tensor | None = None,
     track_step: int = -1,
 ) -> None:
-    """Launch the fused batch-one affine merge used by Kimi-K3 PCP.
+    """Launch the fused batched affine merge used by Kimi-K3 PCP.
 
-    ``gathered`` is ``[cp, max_segments, H, K, V+K]`` in rank-owned
+    ``gathered`` is ``[cp, max_segments, batch, H, K, V+K]`` in rank-owned
     segment order.  The optional device plan supports the extra segment
     created when a radix checkpoint splits a natural zigzag block.
     """
-    cp_size, max_segments, num_heads, key_dim, affine_dim = gathered.shape
+    cp_size, max_segments, batch_size, num_heads, key_dim, affine_dim = gathered.shape
     value_dim = affine_dim - key_dim
-    if initial_state.shape[0] != 1 or key_dim != 128:
+    if initial_state.shape[0] != batch_size or key_dim != 128:
         raise ValueError(
-            "fused KDA CP merge requires batch one and K = 128; "
-            f"got batch={initial_state.shape[0]}, K={key_dim}"
+            "fused KDA CP merge requires matching batch dimensions and K = 128; "
+            f"got batch={initial_state.shape[0]}/{batch_size}, K={key_dim}"
         )
     if owner_ranks is None or source_segments is None or local_indices is None:
-        owners = []
-        sources = []
-        locals_ = []
-        local_id = 0
-        for block_id in range(2 * cp_size):
-            owner = block_id if block_id < cp_size else 2 * cp_size - block_id - 1
-            source = int(block_id >= cp_size)
-            owners.append(owner)
-            sources.append(source)
-            if owner == cp_rank:
-                locals_.append(local_id)
-                local_id += 1
-            else:
-                locals_.append(-1)
-        owner_ranks = torch.tensor(owners, dtype=torch.int32, device=gathered.device)
-        source_segments = torch.tensor(
-            sources, dtype=torch.int32, device=gathered.device
-        )
-        local_indices = torch.tensor(locals_, dtype=torch.int32, device=gathered.device)
-        local_steps = tuple(
-            step_id for step_id, local_id in enumerate(locals_) if local_id >= 0
-        )
+        # The zigzag merge plan depends only on rank topology.  Constructing
+        # three tiny HCU tensors at every KDA layer introduces a synchronous
+        # H2D copy each time and serializes the preceding device work.  Keep
+        # one immutable plan per process/device/topology instead.
+        cache = getattr(merge_kda_cp_affine_states, "_plan_cache", None)
+        if cache is None:
+            cache = {}
+            merge_kda_cp_affine_states._plan_cache = cache
+        cache_key = (str(gathered.device), cp_size, cp_rank)
+        cached_plan = cache.get(cache_key)
+        if cached_plan is None:
+            owners = []
+            sources = []
+            locals_ = []
+            local_id = 0
+            for block_id in range(2 * cp_size):
+                owner = (
+                    block_id if block_id < cp_size else 2 * cp_size - block_id - 1
+                )
+                owners.append(owner)
+                sources.append(int(block_id >= cp_size))
+                if owner == cp_rank:
+                    locals_.append(local_id)
+                    local_id += 1
+                else:
+                    locals_.append(-1)
+            cached_plan = (
+                torch.tensor(owners, dtype=torch.int32, device=gathered.device),
+                torch.tensor(sources, dtype=torch.int32, device=gathered.device),
+                torch.tensor(locals_, dtype=torch.int32, device=gathered.device),
+                tuple(i for i, local_id in enumerate(locals_) if local_id >= 0),
+            )
+            cache[cache_key] = cached_plan
+        owner_ranks, source_segments, local_indices, local_steps = cached_plan
     num_steps = owner_ranks.numel()
     if tracked_state is None:
         tracked_state = final_state
@@ -513,7 +541,7 @@ def merge_kda_cp_affine_states(
             f"local_steps={local_steps}, track_step={track_step}"
         )
     padded_local_steps = (*local_steps, -1, -1, -1)[:3]
-    merge_kda_cp_affine_states_kernel[(triton.cdiv(value_dim, 64), num_heads)](
+    merge_kda_cp_affine_states_kernel[(triton.cdiv(value_dim, 64), batch_size * num_heads)](
         gathered=gathered,
         initial_state=initial_state,
         local_initial=local_initial,
@@ -524,6 +552,7 @@ def merge_kda_cp_affine_states(
         H=num_heads,
         K=key_dim,
         V=value_dim,
+        B=batch_size,
         MAX_SEGMENTS=max_segments,
         NUM_STEPS=num_steps,
         TRACK_STEP=track_step,

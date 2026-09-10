@@ -199,12 +199,8 @@ class DeepseekMHARocmForwardMixin:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        # Kimi-K3 HCU PCP debug fix: the varlen path supports the projected
-        # BF16 Q with FP8 K/V representation used by this launch configuration.
-        # The previous FP8 guard silently selected expanded-K/V all-gather, so CP was not a
-        # compact-latent ring implementation.
-        # Original bring-up restriction (disabled for this validation):
-        #            and self.kv_cache_dtype != "fp8_e4m3"
+        # HCU PCP keeps projected Q local and rotates compact latent K/V. The
+        # attention backend owns any BF16-to-FP8 conversion required by varlen FA.
         use_hcu_mla_cp_ring = bool(
             hcu_mla_use_ring_prefill_cp(forward_batch)
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import accumulate
 from typing import TYPE_CHECKING, Optional
 
@@ -57,6 +58,20 @@ _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
 _is_hcu = is_hcu()
+# Compact-ring cu-seqlens depend only on logical lengths and device. Each
+# attention layer owns a backend instance, so use a bounded process-wide cache
+# to avoid rebuilding identical tiny device tensors in every MLA layer without
+# retaining one device tensor for every request-length combination forever.
+@lru_cache(maxsize=128)
+def _get_hcu_mla_cp_ring_cu_seqlens(
+    lengths: tuple[int, ...], device: torch.device
+) -> torch.Tensor:
+    return torch.tensor(
+        (0, *accumulate(lengths)),
+        device=device,
+        dtype=torch.int32,
+    )
+
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
     if is_hcu():
         props = torch.cuda.get_device_properties(0)
@@ -1704,6 +1719,12 @@ class FlashAttentionBackend(AttentionBackend):
                         )
 
                     if cp_varlen_mode == "compact-ring":
+                        # A CP8 MLA layer launches several varlen rectangles.
+                        # Recreating these tiny device tensors for every
+                        # rectangle and every layer turns into hundreds of
+                        # synchronous H2D copies. The tensors depend only on
+                        # lengths and device, so retain them across layers and
+                        # chunked-prefill ForwardBatch instances.
                         def _run_ring_segment(
                             q_part,
                             k_part,
@@ -1713,15 +1734,11 @@ class FlashAttentionBackend(AttentionBackend):
                             *,
                             causal,
                         ):
-                            cu_q = torch.tensor(
-                                [0, *accumulate(q_lens)],
-                                device=q_part.device,
-                                dtype=torch.int32,
+                            cu_q = _get_hcu_mla_cp_ring_cu_seqlens(
+                                tuple(int(x) for x in q_lens), q_part.device
                             )
-                            cu_k = torch.tensor(
-                                [0, *accumulate(kv_lens)],
-                                device=k_part.device,
-                                dtype=torch.int32,
+                            cu_k = _get_hcu_mla_cp_ring_cu_seqlens(
+                                tuple(int(x) for x in kv_lens), k_part.device
                             )
                             result = _run_hcu_mla_varlen(
                                 q_part,

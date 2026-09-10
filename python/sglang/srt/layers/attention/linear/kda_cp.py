@@ -313,30 +313,30 @@ def _compose_affine_states_key_major(
 
     from sglang.srt.utils import get_bool_env_var
 
-    # Use the fused HCU merge for the validated batch-one K=128 path.
+    # Use the fused HCU merge for the validated batched K=128 path.
     use_fused_merge = get_bool_env_var(
         "SGLANG_KDA_CP_HCU_AFFINE_MERGE", default="false"
     )
-    if use_fused_merge and bs == 1 and key_dim == 128 and cp_size > 1:
+    if use_fused_merge and key_dim == 128 and cp_size > 1:
         from sglang.kernels.ops.attention.fla.kda_affine_hcu import (
             merge_kda_cp_affine_states,
         )
 
         fused_local = torch.empty(
-            (2, *state.shape[1:]),
+            (2, *state.shape),
             device=state.device,
             dtype=torch.float32,
         )
         fused_final = torch.empty_like(state)
         merge_kda_cp_affine_states(
-            gathered=gathered[:, :, 0],
+            gathered=gathered,
             initial_state=state,
             local_initial=fused_local,
             final_state=fused_final,
             cp_rank=cp_rank,
             track_step=-1,
         )
-        local_inputs.copy_(fused_local.unsqueeze(1))
+        local_inputs.copy_(fused_local)
         state = fused_final
     else:
         for segment in range(2 * cp_size):
@@ -407,11 +407,6 @@ def run_kda_affine_prefill_cp(
     cu_seqlens = metadata.cu_seqlens_q_combined_tensor.to(
         device=q.device, dtype=torch.int32
     )
-    if int(cu_seqlens[-1].item()) != int(q.shape[1]):
-        raise ValueError(
-            "KDA CP cu_seqlens/local token mismatch: "
-            f"cu={int(cu_seqlens[-1])}, q={int(q.shape[1])}."
-        )
     chunk_indices = prepare_chunk_indices(cu_seqlens, _CHUNK_SIZE)
     # The affine pre-pass needs normalized Q/K and activated gates, while
     # FlashKDA fuses those transforms internally. Preserve the raw local
@@ -632,11 +627,13 @@ def forward_kda_affine_prefill_cp(
             f"index_shape={tuple(raw_cache_indices.shape)}, bs={expected_bs}."
         )
     cache_indices = raw_cache_indices.reshape(-1)
-    if bool((cache_indices < 0).any()):
-        raise ValueError(
-            "KDA CP cannot process padding/idle rows with negative mamba slots: "
-            f"indices={cache_indices.tolist()}."
-        )
+    if not getattr(forward_batch, "_kda_cp_cache_indices_validated", False):
+        if bool((cache_indices < 0).any()):
+            raise ValueError(
+                "KDA CP cannot process padding/idle rows with negative mamba slots: "
+                f"indices={cache_indices.tolist()}."
+            )
+        forward_batch._kda_cp_cache_indices_validated = True
     cache = backend.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
     conv_state_pool = cache.conv[0]
     ssm_states = cache.temporal

@@ -104,16 +104,12 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
         return AttnForwardMethod.MLA
 
     # MLA prefill CP needs a backend-specific local-query implementation.  On
-    # HCU the explicit varlen path is the PCP implementation: it gathers the
-    # expanded K/V in natural token order and runs the two zigzag query halves.
-    # Keep the full-query environment as an oracle, but do not make the oracle
-    # the default production path.
+    # HCU, MHA_ONE_SHOT preserves explicit local Q and compact latent K/V. The
+    # HCU backend rotates compact K/V shards, expands one source rank at a time,
+    # and merges causal rectangles without materializing full expanded K/V.
     if mla_use_prefill_cp(forward_batch):
-        # HCU's flash-attention implementation consumes explicit Q/K/V for
-        # prefill PCP.  Returning MHA_ONE_SHOT here preserves the normal MLA
-        # projection code while selecting the local-Q varlen CP branch in
-        # FlashAttentionBackend.  Non-HCU backends retain their existing MLA
-        # dispatch and therefore their validated non-PCP behavior.
+        # Returning MHA_ONE_SHOT selects the local-Q compact-ring varlen branch
+        # in FlashAttentionBackend. Non-HCU backends retain their MLA dispatch.
         if backend_name == "hcu_mla":
             return AttnForwardMethod.MHA_ONE_SHOT
         return _dispatch_mla_subtype(attn, forward_batch)
