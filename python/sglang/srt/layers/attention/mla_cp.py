@@ -18,6 +18,16 @@ class HCUMLACPRingSourceLayout:
     early_lens: tuple[int, ...]
     late_lens: tuple[int, ...]
 
+
+def clear_hcu_mla_cp_ring_state(forward_batch: Any) -> None:
+    """Release the per-layer compact-ring tensors after attention finishes."""
+    forward_batch.mla_cp_hcu_ring_active = False
+    forward_batch.mla_cp_local_k = None
+    forward_batch.mla_cp_local_k_rope = None
+    forward_batch.mla_cp_prefix_k = None
+    forward_batch.mla_cp_prefix_k_rope = None
+
+
 def hcu_mla_use_ring_prefill_cp(forward_batch: Any) -> bool:
     """Whether the HCU compact-latent MLA ring can own this prefill.
 
@@ -52,6 +62,7 @@ def hcu_mla_use_ring_prefill_cp(forward_batch: Any) -> bool:
         and not bool(getattr(forward_batch, "attn_attend_prefix_cache", False))
     )
 
+
 def select_mha_prefix_kv_indices(
     kv_indices: torch.Tensor,
     seq_lens: list[int],
@@ -84,9 +95,6 @@ def select_mha_prefix_kv_indices(
         return kv_indices.new_empty((0,))
     return selected[0] if len(selected) == 1 else torch.cat(selected)
 
-def get_zigzag_mla_cp_ring_visibility(cp_rank: int, source_rank: int):
-    """Return early->early, early->late and late->late visibility."""
-    return source_rank <= cp_rank, True, source_rank >= cp_rank
 
 def get_zigzag_cp_rank_chunk_indices(
     batch_size: int, cp_size: int, cp_rank: int
@@ -100,6 +108,7 @@ def get_zigzag_cp_rank_chunk_indices(
     return list(range(cp_rank, batch_size * segments, segments)) + list(
         range(segments - cp_rank - 1, batch_size * segments, segments)
     )
+
 
 def build_hcu_mla_cp_ring_source_layouts(
     metadata: Any, *, cp_size: int
@@ -133,6 +142,7 @@ def build_hcu_mla_cp_ring_source_layouts(
         )
     return tuple(layouts)
 
+
 def build_hcu_mla_cp_ring_cache_locs(
     cache_locs: torch.Tensor, metadata: Any, *, cp_size: int
 ) -> tuple[torch.Tensor, ...]:
@@ -159,6 +169,7 @@ def build_hcu_mla_cp_ring_cache_locs(
         )
         for source_rank in range(cp_size)
     )
+
 
 def run_hcu_mla_cp_ring(
     q: torch.Tensor,
@@ -218,7 +229,6 @@ def run_hcu_mla_cp_ring(
     latent_width = local_latent.shape[1] * local_latent.shape[2]
     rope_width = local_rope.shape[1] * local_rope.shape[2]
     max_rank_tokens = max(layout.token_count for layout in layouts)
-
 
     packed = local_latent.new_zeros((max_rank_tokens, latent_width + rope_width))
     packed[: local_layout.token_count, :latent_width].copy_(local_latent.flatten(1))
@@ -337,8 +347,6 @@ def run_hcu_mla_cp_ring(
             return empty, empty
         return torch.cat(prev_parts, dim=0), torch.cat(next_parts, dim=0)
 
-    packed_rectangles = cp_size > 1
-
     def store_source_cache(
         source_rank: int,
         source_latent: torch.Tensor,
@@ -393,174 +401,126 @@ def run_hcu_mla_cp_ring(
             source_k, source_v = expand_compact(source_latent, source_rope)
         early_k, late_k = source_k[:early_end], source_k[early_end:]
         early_v, late_v = source_v[:early_end], source_v[early_end:]
-        early_to_prev, early_to_next, late_to_next = (
-            get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
-        )
 
-        if packed_rectangles:
-            # For the local source, q_prev followed by q_next and early_k
-            # followed by late_k form one equal-length causal sequence.  A
-            # causal FA call therefore exactly covers the old three calls:
-            # q_prev->early (causal), q_next->early (non-causal), and
-            # q_next->late (causal).
-            if source_rank == cp_rank:
-                packed_q = pack_query_halves()
-                packed_k = pack_source_halves(
-                    early_k,
-                    late_k,
+        # For the local source, q_prev followed by q_next and early_k
+        # followed by late_k form one equal-length causal sequence.  A
+        # causal FA call therefore exactly covers the old three calls:
+        # q_prev->early (causal), q_next->early (non-causal), and
+        # q_next->late (causal).
+        if source_rank == cp_rank:
+            packed_q = pack_query_halves()
+            packed_k = pack_source_halves(
+                early_k,
+                late_k,
+                source_layout.early_lens,
+                source_layout.late_lens,
+            )
+            packed_lens = tuple(
+                int(prev_len) + int(next_len)
+                for prev_len, next_len in zip(
+                    local_prev_lens, local_next_lens
+                )
+            )
+            packed_k_lens = tuple(
+                int(early_len) + int(late_len)
+                for early_len, late_len in zip(
                     source_layout.early_lens,
                     source_layout.late_lens,
                 )
-                packed_lens = tuple(
-                    int(prev_len) + int(next_len)
-                    for prev_len, next_len in zip(
-                        local_prev_lens, local_next_lens
-                    )
+            )
+            if packed_lens != packed_k_lens:
+                raise ValueError(
+                    "HCU MLA packed local geometry mismatch: "
+                    f"q={packed_lens}, kv={packed_k_lens}."
                 )
-                packed_k_lens = tuple(
-                    int(early_len) + int(late_len)
-                    for early_len, late_len in zip(
-                        source_layout.early_lens,
-                        source_layout.late_lens,
-                    )
-                )
-                if packed_lens != packed_k_lens:
-                    raise ValueError(
-                        "HCU MLA packed local geometry mismatch: "
-                        f"q={packed_lens}, kv={packed_k_lens}."
-                    )
-                packed_output, packed_lse = run_segment(
-                    packed_q,
-                    packed_k,
-                    pack_source_halves(
-                        early_v,
-                        late_v,
-                        source_layout.early_lens,
-                        source_layout.late_lens,
-                    ),
-                    list(packed_lens),
-                    list(packed_k_lens),
-                    causal=True,
-                )
-                new_prev, new_next = split_query_halves(
-                    packed_output, local_prev_lens, local_next_lens
-                )
-                new_prev_lse, new_next_lse = split_query_halves(
-                    packed_lse, local_prev_lens, local_next_lens
-                )
-                output_prev, lse_prev = merge_state(
-                    output_prev, lse_prev, new_prev, new_prev_lse
-                )
-                output_next, lse_next = merge_state(
-                    output_next, lse_next, new_next, new_next_lse
-                )
-            elif source_rank < cp_rank:
-                # This source's early slab is non-causal for both query
-                # halves.  Pack the two query halves per request while keeping
-                # the single compact source expanded only once.
-                packed_q = pack_query_halves()
-                packed_lens = tuple(
-                    int(prev_len) + int(next_len)
-                    for prev_len, next_len in zip(
-                        local_prev_lens, local_next_lens
-                    )
-                )
-                packed_output, packed_lse = run_segment(
-                    packed_q,
-                    early_k,
-                    early_v,
-                    list(packed_lens),
-                    list(source_layout.early_lens),
-                    causal=False,
-                )
-                new_prev, new_next = split_query_halves(
-                    packed_output, local_prev_lens, local_next_lens
-                )
-                new_prev_lse, new_next_lse = split_query_halves(
-                    packed_lse, local_prev_lens, local_next_lens
-                )
-                output_prev, lse_prev = merge_state(
-                    output_prev, lse_prev, new_prev, new_prev_lse
-                )
-                output_next, lse_next = merge_state(
-                    output_next, lse_next, new_next, new_next_lse
-                )
-            else:
-                # A later source is visible only to q_next, and its early and
-                # late slabs share the same non-causal horizon.
-                packed_k = pack_source_halves(
-                    early_k,
-                    late_k,
-                    source_layout.early_lens,
-                    source_layout.late_lens,
-                )
-                packed_v = pack_source_halves(
+            packed_output, packed_lse = run_segment(
+                packed_q,
+                packed_k,
+                pack_source_halves(
                     early_v,
                     late_v,
                     source_layout.early_lens,
                     source_layout.late_lens,
-                )
-                packed_k_lens = tuple(
-                    int(early_len) + int(late_len)
-                    for early_len, late_len in zip(
-                        source_layout.early_lens,
-                        source_layout.late_lens,
-                    )
-                )
-                new_next, new_next_lse = run_segment(
-                    q_next,
-                    packed_k,
-                    packed_v,
-                    list(local_next_lens),
-                    list(packed_k_lens),
-                    causal=False,
-                )
-                output_next, lse_next = merge_state(
-                    output_next, lse_next, new_next, new_next_lse
-                )
-
-            store_source_cache(
-                source_rank, source_latent, source_rope, source_layout
+                ),
+                list(packed_lens),
+                list(packed_k_lens),
+                causal=True,
             )
-
-            if requests is not None:
-                for request in requests:
-                    request.wait()
-                packed = recv_packed
-            continue
-
-        if early_to_prev:
-            output_prev, lse_prev = accumulate_state(
-                output_prev,
-                lse_prev,
-                q_prev,
+            new_prev, new_next = split_query_halves(
+                packed_output, local_prev_lens, local_next_lens
+            )
+            new_prev_lse, new_next_lse = split_query_halves(
+                packed_lse, local_prev_lens, local_next_lens
+            )
+            output_prev, lse_prev = merge_state(
+                output_prev, lse_prev, new_prev, new_prev_lse
+            )
+            output_next, lse_next = merge_state(
+                output_next, lse_next, new_next, new_next_lse
+            )
+        elif source_rank < cp_rank:
+            # This source's early slab is non-causal for both query
+            # halves.  Pack the two query halves per request while keeping
+            # the single compact source expanded only once.
+            packed_q = pack_query_halves()
+            packed_lens = tuple(
+                int(prev_len) + int(next_len)
+                for prev_len, next_len in zip(
+                    local_prev_lens, local_next_lens
+                )
+            )
+            packed_output, packed_lse = run_segment(
+                packed_q,
                 early_k,
                 early_v,
-                local_prev_lens,
-                source_layout.early_lens,
-                causal=source_rank == cp_rank,
-            )
-        if early_to_next:
-            output_next, lse_next = accumulate_state(
-                output_next,
-                lse_next,
-                q_next,
-                early_k,
-                early_v,
-                local_next_lens,
-                source_layout.early_lens,
+                list(packed_lens),
+                list(source_layout.early_lens),
                 causal=False,
             )
-        if late_to_next:
-            output_next, lse_next = accumulate_state(
-                output_next,
-                lse_next,
-                q_next,
+            new_prev, new_next = split_query_halves(
+                packed_output, local_prev_lens, local_next_lens
+            )
+            new_prev_lse, new_next_lse = split_query_halves(
+                packed_lse, local_prev_lens, local_next_lens
+            )
+            output_prev, lse_prev = merge_state(
+                output_prev, lse_prev, new_prev, new_prev_lse
+            )
+            output_next, lse_next = merge_state(
+                output_next, lse_next, new_next, new_next_lse
+            )
+        else:
+            # A later source is visible only to q_next, and its early and
+            # late slabs share the same non-causal horizon.
+            packed_k = pack_source_halves(
+                early_k,
                 late_k,
-                late_v,
-                local_next_lens,
+                source_layout.early_lens,
                 source_layout.late_lens,
-                causal=source_rank == cp_rank,
+            )
+            packed_v = pack_source_halves(
+                early_v,
+                late_v,
+                source_layout.early_lens,
+                source_layout.late_lens,
+            )
+            packed_k_lens = tuple(
+                int(early_len) + int(late_len)
+                for early_len, late_len in zip(
+                    source_layout.early_lens,
+                    source_layout.late_lens,
+                )
+            )
+            new_next, new_next_lse = run_segment(
+                q_next,
+                packed_k,
+                packed_v,
+                list(local_next_lens),
+                list(packed_k_lens),
+                causal=False,
+            )
+            output_next, lse_next = merge_state(
+                output_next, lse_next, new_next, new_next_lse
             )
 
         store_source_cache(
@@ -621,23 +581,15 @@ def run_hcu_mla_cp_ring(
 
     if output_prev is None or output_next is None:
         raise RuntimeError("HCU MLA CP ring did not initialize both query halves.")
-    for name in (
-        "mla_cp_local_k",
-        "mla_cp_local_k_rope",
-        "mla_cp_prefix_k",
-        "mla_cp_prefix_k_rope",
-    ):
-        if hasattr(forward_batch, name):
-            delattr(forward_batch, name)
-
     return torch.cat((output_prev, output_next), dim=0)
+
 
 __all__ = [
     "HCUMLACPRingSourceLayout",
     "build_hcu_mla_cp_ring_cache_locs",
     "build_hcu_mla_cp_ring_source_layouts",
+    "clear_hcu_mla_cp_ring_state",
     "get_zigzag_cp_rank_chunk_indices",
-    "get_zigzag_mla_cp_ring_visibility",
     "hcu_mla_use_ring_prefill_cp",
     "run_hcu_mla_cp_ring",
     "select_mha_prefix_kv_indices",

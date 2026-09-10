@@ -7,7 +7,6 @@ can use the same tile recurrence without materializing chunk states.
 
 from __future__ import annotations
 
-
 import torch
 import triton
 import triton.language as tl
@@ -563,7 +562,6 @@ def merge_kda_cp_affine_states(
         num_warps=4,
         num_stages=1,
     )
-
 
 
 def chunk_gated_delta_rule_fwd_affine_hcu(

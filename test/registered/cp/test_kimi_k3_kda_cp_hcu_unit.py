@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 
@@ -110,7 +111,8 @@ def test_kda_prefill_cp_gate_rejects_empty_zigzag_segments():
         patch.object(_KDA_CP, "is_hcu", return_value=True),
         patch.object(_KDA_CP, "is_cp_v2_active", return_value=True),
     ):
-        assert not _KDA_CP.kda_use_prefill_cp(forward_batch)
+        with pytest.raises(NotImplementedError, match="cannot fall back"):
+            _KDA_CP.kda_use_prefill_cp(forward_batch)
 
 
 def test_kda_prefill_cp_gate_accepts_hcu_cp_v2_extend():
@@ -142,7 +144,10 @@ def test_zigzag_conv_initial_and_final_states():
     )
 
     for rank in range(2):
-        forward_batch = SimpleNamespace(attn_cp_metadata=_metadata(rank))
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=_metadata(rank),
+            kda_cp_cache_indices_validated=False,
+        )
         conv_pool = torch.tensor([[[-2.0], [-1.0]]])
         with patch.object(
             _KDA_CP, "get_parallel", return_value=_parallel(rank, rank_tails)

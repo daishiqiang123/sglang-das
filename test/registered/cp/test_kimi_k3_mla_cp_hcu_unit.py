@@ -5,8 +5,8 @@ import torch
 from sglang.srt.layers.attention.mla_cp import (
     build_hcu_mla_cp_ring_cache_locs,
     build_hcu_mla_cp_ring_source_layouts,
+    clear_hcu_mla_cp_ring_state,
     get_zigzag_cp_rank_chunk_indices,
-    get_zigzag_mla_cp_ring_visibility,
     select_mha_prefix_kv_indices,
 )
 
@@ -42,13 +42,22 @@ def test_ring_cache_locations_restore_natural_global_positions():
     )
 
 
-def test_ring_visibility_matches_zigzag_causal_geometry():
-    # rank0: source0 early is diagonal; source1 early is in the future.
-    assert get_zigzag_mla_cp_ring_visibility(0, 0) == (True, True, True)
-    assert get_zigzag_mla_cp_ring_visibility(0, 1) == (False, True, True)
-    # rank1: source0 early is history; source0 late is in the future.
-    assert get_zigzag_mla_cp_ring_visibility(1, 0) == (True, True, False)
-    assert get_zigzag_mla_cp_ring_visibility(1, 1) == (True, True, True)
+def test_clear_ring_state_releases_all_per_layer_tensors():
+    forward_batch = SimpleNamespace(
+        mla_cp_hcu_ring_active=True,
+        mla_cp_local_k=object(),
+        mla_cp_local_k_rope=object(),
+        mla_cp_prefix_k=object(),
+        mla_cp_prefix_k_rope=object(),
+    )
+
+    clear_hcu_mla_cp_ring_state(forward_batch)
+
+    assert not forward_batch.mla_cp_hcu_ring_active
+    assert forward_batch.mla_cp_local_k is None
+    assert forward_batch.mla_cp_local_k_rope is None
+    assert forward_batch.mla_cp_prefix_k is None
+    assert forward_batch.mla_cp_prefix_k_rope is None
 
 
 def test_select_mha_prefix_indices_keeps_each_request_prefix_only():

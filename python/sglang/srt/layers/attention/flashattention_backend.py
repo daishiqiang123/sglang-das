@@ -20,7 +20,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.mla_cp import run_hcu_mla_cp_ring
+from sglang.srt.layers.attention.mla_cp import (
+    clear_hcu_mla_cp_ring_state,
+    run_hcu_mla_cp_ring,
+)
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -1869,16 +1872,19 @@ class FlashAttentionBackend(AttentionBackend):
                             segment_output, segment_lse, *_ = result
                             return segment_output, segment_lse.T.contiguous()
 
-                        output = run_hcu_mla_cp_ring(
-                            q,
-                            k,
-                            v,
-                            forward_batch,
-                            layer,
-                            self.token_to_kv_pool,
-                            run_segment=_run_ring_segment,
-                            merge_segment=merge_state_v2_wrapper,
-                        )
+                        try:
+                            output = run_hcu_mla_cp_ring(
+                                q,
+                                k,
+                                v,
+                                forward_batch,
+                                layer,
+                                self.token_to_kv_pool,
+                                run_segment=_run_ring_segment,
+                                merge_segment=merge_state_v2_wrapper,
+                            )
+                        finally:
+                            clear_hcu_mla_cp_ring_state(forward_batch)
                     else:
                         output = _run_hcu_mla_varlen(
                             q,

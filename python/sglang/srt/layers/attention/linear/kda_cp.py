@@ -5,10 +5,9 @@ zigzag segment is summarized as ``state_out = C + state_in @ M``.  CP ranks
 all-gather only ``[C | M]``, compose the transforms in natural token order,
 and then execute their local segments with the correct incoming states.
 
-This implementation intentionally reuses SGLang's existing Triton/boltops FLA
-building blocks.  It is the HCU bring-up counterpart of the NPU affine-state
-implementation in sgl-project/sglang#35226; no new compiled operator is needed
-for the first performance measurement.
+This is the HCU counterpart of the NPU affine-state implementation in
+sgl-project/sglang#35226.  It provides HCU affine preprocess/merge kernels and
+keeps the generic Triton formulation as a correctness fallback oracle.
 """
 
 from __future__ import annotations
@@ -19,54 +18,72 @@ import torch
 
 _CHUNK_SIZE = 64
 
+
 def get_parallel():
     """Lazy runtime lookup so metadata-only tests never initialize HCU kernels."""
     from sglang.srt.runtime_context import get_parallel as runtime_get_parallel
 
     return runtime_get_parallel()
 
+
 def is_hcu() -> bool:
     from sglang.srt.utils import is_hcu as runtime_is_hcu
 
     return runtime_is_hcu()
+
 
 def is_cp_v2_active(forward_batch: Any) -> bool:
     from sglang.srt.layers.cp.utils import is_cp_v2_active as runtime_cp_v2_active
 
     return runtime_cp_v2_active(forward_batch)
 
+
 def _use_kda_hcu_op() -> bool:
     from sglang.srt.utils import get_bool_env_var
 
     return is_hcu() and get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
 
+
 def _use_kda_hcu_affine() -> bool:
-    """Use the PR #745-style compact HCU affine prepass when explicitly enabled."""
+    """Use the PR #745-style compact HCU affine prepass by default on HCU."""
     from sglang.srt.utils import get_bool_env_var
 
-    return is_hcu() and get_bool_env_var("SGLANG_KDA_USE_HCU_AFFINE")
+    return is_hcu() and get_bool_env_var(
+        "SGLANG_KDA_USE_HCU_AFFINE", default="true"
+    )
+
 
 def kda_use_prefill_cp(forward_batch: Any) -> bool:
-    """Whether this forward must use the KDA affine-state PCP path."""
+    """Return whether KDA PCP owns this forward, failing closed once active."""
     parallel = get_parallel()
     mode = forward_batch.forward_mode
     metadata = getattr(forward_batch, "attn_cp_metadata", None)
     split_list = getattr(metadata, "split_list", None)
-    return bool(
-        is_hcu()
-        and parallel.attn_cp_size > 1
-        and is_cp_v2_active(forward_batch)
-        and metadata is not None
-        # The affine preprocessing kernel needs a real segment for every
-        # natural zigzag block.  This matches the final NPU PCP path rather
-        # than entering the kernel with identity-only empty blocks.
+    if (
+        not is_hcu()
+        or parallel.attn_cp_size <= 1
+        or not is_cp_v2_active(forward_batch)
+    ):
+        return False
+
+    supported = bool(
+        metadata is not None
         and split_list
-        and min(split_list) > 0
+        and min(int(length) for length in split_list) > 0
+        and mode is not None
         and mode.is_context_parallel_extend()
         and not mode.is_mixed()
         and not mode.is_target_verify()
         and not mode.is_draft_extend_v2()
     )
+    if not supported:
+        raise NotImplementedError(
+            "Active KDA prefill CP cannot fall back to the ordinary local-shard "
+            "KDA path. It requires non-empty zigzag metadata and a non-mixed "
+            "context-parallel extend batch."
+        )
+    return True
+
 
 def _validate_zigzag_metadata(metadata: Any, cp_size: int) -> None:
     required = (
@@ -115,17 +132,20 @@ def _validate_zigzag_metadata(metadata: Any, cp_size: int) -> None:
             "KDA affine PCP currently requires every zigzag block to be non-empty."
         )
 
+
 def _natural_segment_owner(segment: int, cp_size: int) -> tuple[int, int]:
     """Return ``(cp_rank, local_half)`` for a natural zigzag segment."""
     if segment < cp_size:
         return segment, 0
     return 2 * cp_size - 1 - segment, 1
 
+
 def _all_gather_cp(x: torch.Tensor) -> torch.Tensor:
     parallel = get_parallel()
     gathered = x.new_empty((parallel.attn_cp_size * x.shape[0], *x.shape[1:]))
     parallel.attn_cp_group.all_gather_into_tensor(gathered, x.contiguous())
     return gathered
+
 
 def prepare_kda_cp_conv_states(
     mixed_qkv: torch.Tensor,
@@ -174,13 +194,13 @@ def prepare_kda_cp_conv_states(
     # Checking a device tensor with bool(any()) in every layer forces a
     # device-to-host synchronization and serializes the CP collectives.  Keep
     # the defensive validation, but perform it only once per forward.
-    if not getattr(forward_batch, "_kda_cp_cache_indices_validated", False):
+    if not forward_batch.kda_cp_cache_indices_validated:
         if bool((cache_indices < 0).any()):
             raise ValueError(
                 "KDA CP requires one valid recurrent-state slot per request: "
                 f"slots={cache_indices.tolist()}, bs={bs}."
             )
-        forward_batch._kda_cp_cache_indices_validated = True
+        forward_batch.kda_cp_cache_indices_validated = True
 
     window = int(conv_state_pool.shape[1])
     channels = int(mixed_qkv.shape[-1])
@@ -226,6 +246,7 @@ def prepare_kda_cp_conv_states(
     )
     return local_initial.reshape(2 * bs, window, channels), final_states, cu_seqlens, local_lens
 
+
 def _compose_affine_states(
     local_affine: torch.Tensor,
     initial_state: torch.Tensor,
@@ -269,6 +290,7 @@ def _compose_affine_states(
     return local_inputs.reshape(2 * bs, *initial_state.shape[1:]), state.to(
         initial_state.dtype
     )
+
 
 def _compose_affine_states_key_major(
     local_affine: torch.Tensor,
@@ -315,7 +337,7 @@ def _compose_affine_states_key_major(
 
     # Use the fused HCU merge for the validated batched K=128 path.
     use_fused_merge = get_bool_env_var(
-        "SGLANG_KDA_CP_HCU_AFFINE_MERGE", default="false"
+        "SGLANG_KDA_CP_HCU_AFFINE_MERGE", default="true"
     )
     if use_fused_merge and key_dim == 128 and cp_size > 1:
         from sglang.kernels.ops.attention.fla.kda_affine_hcu import (
@@ -355,6 +377,7 @@ def _compose_affine_states_key_major(
         2 * bs, *initial_state.shape[1:]
     ).contiguous()
     return local_inputs, state.transpose(-1, -2).to(initial_state.dtype).contiguous()
+
 
 def run_kda_affine_prefill_cp(
     *,
@@ -596,6 +619,7 @@ def run_kda_affine_prefill_cp(
     ssm_states.index_copy_(0, cache_indices.to(torch.long), final_state)
     return output
 
+
 def forward_kda_affine_prefill_cp(
     backend: Any,
     layer: Any,
@@ -627,13 +651,13 @@ def forward_kda_affine_prefill_cp(
             f"index_shape={tuple(raw_cache_indices.shape)}, bs={expected_bs}."
         )
     cache_indices = raw_cache_indices.reshape(-1)
-    if not getattr(forward_batch, "_kda_cp_cache_indices_validated", False):
+    if not forward_batch.kda_cp_cache_indices_validated:
         if bool((cache_indices < 0).any()):
             raise ValueError(
                 "KDA CP cannot process padding/idle rows with negative mamba slots: "
                 f"indices={cache_indices.tolist()}."
             )
-        forward_batch._kda_cp_cache_indices_validated = True
+        forward_batch.kda_cp_cache_indices_validated = True
     cache = backend.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
     conv_state_pool = cache.conv[0]
     ssm_states = cache.temporal
@@ -713,18 +737,17 @@ def forward_kda_affine_prefill_cp(
     k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
     v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
     output_kernel = None
-    if get_bool_env_var("SGLANG_KDA_CP_FLASHKDA_OUTPUT", default="false"):
+    if get_bool_env_var("SGLANG_KDA_CP_FLASHKDA_OUTPUT", default="true"):
         from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
             FlashKDAKernel,
         )
 
         candidate = backend.kernel_dispatcher.extend_kernel
-        if not isinstance(candidate, FlashKDAKernel):
-            raise RuntimeError(
-                "SGLANG_KDA_CP_FLASHKDA_OUTPUT requires "
-                "--linear-attn-prefill-backend flashkda."
-            )
-        output_kernel = candidate
+        # FlashKDA is an output-pass optimization, not a PCP correctness
+        # requirement. Other prefill backends retain the true-PCP Triton output
+        # pass after the same affine-state composition.
+        if isinstance(candidate, FlashKDAKernel):
+            output_kernel = candidate
 
     output = run_kda_affine_prefill_cp(
         q=q,
@@ -744,6 +767,7 @@ def forward_kda_affine_prefill_cp(
         0, cache_indices.to(torch.long), final_conv_states.to(conv_state_pool.dtype)
     )
     return output
+
 
 __all__ = [
     "forward_kda_affine_prefill_cp",

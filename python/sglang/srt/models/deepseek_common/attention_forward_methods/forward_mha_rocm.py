@@ -204,8 +204,8 @@ class DeepseekMHARocmForwardMixin:
         use_hcu_mla_cp_ring = bool(
             hcu_mla_use_ring_prefill_cp(forward_batch)
         )
-        forward_batch.mla_cp_hcu_ring_active = use_hcu_mla_cp_ring
         if use_hcu_mla_cp_ring:
+            forward_batch.mla_cp_hcu_ring_active = True
             # Keep only the rank-local compact MLA representation.  The HCU
             # attention backend rotates this latent K + K-RoPE shard, expands
             # one source rank at a time and writes every received shard to its
