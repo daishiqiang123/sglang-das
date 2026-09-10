@@ -370,7 +370,12 @@ class EagerRunner(BaseRunner):
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-            hidden_states = model.model(
+            context_parallel_model = (
+                model.get_context_parallel_model()
+                if hasattr(model, "get_context_parallel_model")
+                else model.model
+            )
+            hidden_states = context_parallel_model(
                 forward_batch.input_ids,
                 sharded_positions,
                 forward_batch,

@@ -859,8 +859,15 @@ class HCUMLABackend(AttentionBackend):
         ):
             if not self.skip_prefill:
                 return self.flashattn_backend.forward_extend(
-                            q, k, v, layer, forward_batch, save_kv_cache,
-                        )
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope=q_rope,
+                    k_rope=k_rope,
+                )
             else:
                 raise RuntimeError("skip prefill but use forward_extend")
 

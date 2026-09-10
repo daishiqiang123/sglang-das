@@ -103,10 +103,15 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
-    # MLA prefill CP forces absorbed MLA regardless of prefix length: the
-    # CP path gathers latent KV via rebuild_cp_kv_cache and feeds the
-    # backend's absorbed-MLA kernel.
+    # MLA prefill CP needs a backend-specific local-query implementation.  On
+    # HCU, MHA_ONE_SHOT preserves explicit local Q and compact latent K/V. The
+    # HCU backend rotates compact K/V shards, expands one source rank at a time,
+    # and merges causal rectangles without materializing full expanded K/V.
     if mla_use_prefill_cp(forward_batch):
+        # Returning MHA_ONE_SHOT selects the local-Q compact-ring varlen branch
+        # in FlashAttentionBackend. Non-HCU backends retain their MLA dispatch.
+        if backend_name == "hcu_mla":
+            return AttnForwardMethod.MHA_ONE_SHOT
         return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)

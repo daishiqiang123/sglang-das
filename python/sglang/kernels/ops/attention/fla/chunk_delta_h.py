@@ -103,6 +103,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_INITIAL_STATE: tl.constexpr,
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
+    STORE_CHUNK_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -131,7 +132,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
 
     # calculate offset
-    h += ((boh * H + i_h) * V * K).to(tl.int64)
+    if STORE_CHUNK_STATE:
+        h += ((boh * H + i_h) * V * K).to(tl.int64)
     v += ((bos * H + i_h) * V).to(tl.int64)
     k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
     w += ((bos * H + i_h) * K).to(tl.int64)
@@ -179,25 +181,26 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # main recurrence
     for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(
-            h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
-        )
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_h2 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+        if STORE_CHUNK_STATE:
+            p_h1 = tl.make_block_ptr(
+                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
             )
-            tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
-        if K > 128:
-            p_h3 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
-            )
-            tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
-        if K > 192:
-            p_h4 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
-            )
-            tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+            if K > 64:
+                p_h2 = tl.make_block_ptr(
+                    h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                )
+                tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+            if K > 128:
+                p_h3 = tl.make_block_ptr(
+                    h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                )
+                tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
+            if K > 192:
+                p_h4 = tl.make_block_ptr(
+                    h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                )
+                tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -350,14 +353,15 @@ def chunk_gated_delta_rule_fwd_h(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     save_new_value: bool = True,
+    materialize_chunk_states: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     assert not (
         use_exp2 and g is not None
     ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
-    if _USE_KDA_HCU_FROM_TRITON:
+    if _USE_KDA_HCU_FROM_TRITON and materialize_chunk_states:
         h, v_new, _ = _triton_fwd_h(
             k,
             w,
@@ -393,7 +397,12 @@ def chunk_gated_delta_rule_fwd_h(
             prepare_chunk_offsets(cu_seqlens, BT),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
-    if _USE_KDA_HCU_FROM_AITER and K == 128 and V == 128:
+    if (
+        _USE_KDA_HCU_FROM_AITER
+        and materialize_chunk_states
+        and K == 128
+        and V == 128
+    ):
         aiter_initial_state = initial_state
         aiter_initial_state_indices = initial_state_indices
         packed_state_valid_mask = None
@@ -468,7 +477,11 @@ def chunk_gated_delta_rule_fwd_h(
             )
         return h, v_new
 
-    h = k.new_empty(B, NT, H, V, K)
+    # Affine-state preprocessing only needs the in-place final state. Avoid
+    # materializing [B, NT, H, V, K], which is the dominant PCP scratch.
+    h = (
+        k.new_empty(B, NT, H, V, K) if materialize_chunk_states else k.new_empty(1)
+    )
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -501,8 +514,9 @@ def chunk_gated_delta_rule_fwd_h(
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
+        STORE_CHUNK_STATE=materialize_chunk_states,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
     )
-    return h, v_new
+    return (h if materialize_chunk_states else None), v_new

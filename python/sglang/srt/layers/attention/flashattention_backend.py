@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+from itertools import accumulate
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -18,6 +20,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.mla_cp import (
+    clear_hcu_mla_cp_ring_state,
+    run_hcu_mla_cp_ring,
+)
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -56,6 +62,19 @@ _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
 _is_hcu = is_hcu()
+# Compact-ring cu-seqlens depend only on logical lengths and device. Each
+# attention layer owns a backend instance, so use a bounded process-wide cache
+# to avoid rebuilding identical tiny device tensors in every MLA layer without
+# retaining one device tensor for every request-length combination forever.
+@lru_cache(maxsize=128)
+def _get_hcu_mla_cp_ring_cu_seqlens(
+    lengths: tuple[int, ...], device: torch.device
+) -> torch.Tensor:
+    return torch.tensor(
+        (0, *accumulate(lengths)),
+        device=device,
+        dtype=torch.int32,
+    )
 
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
     if is_hcu():
@@ -1673,6 +1692,16 @@ class FlashAttentionBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
+                if (
+                    _is_hcu
+                    and is_cp_v2_active(forward_batch)
+                    and forward_batch.attn_attend_prefix_cache
+                ):
+                    raise NotImplementedError(
+                        "HCU MLA compact-ring PCP does not yet support "
+                        "chunked prefix-cache attention. Run "
+                        "validation with --disable-radix-cache."
+                    )
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
                     assert not get_schedule().disable_chunked_prefix_cache
@@ -1702,35 +1731,185 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    cu_seqlens_k = (
-                        metadata.cu_seqlens_q
-                        if not forward_batch.mha_one_shot
-                        else metadata.cu_seqlens_k
-                    )
-                    max_seqlen_k = (
-                        metadata.max_seq_len_q
-                        if not forward_batch.mha_one_shot
-                        else metadata.max_seq_len_k
-                    )
-                    k = k.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else k
-                    v = v.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else v
-                    output = flash_attn_varlen_func(
-                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
-                        cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k=cu_seqlens_k,
-                        max_seqlen_q=metadata.max_seq_len_q,
-                        max_seqlen_k=max_seqlen_k,
-                        softmax_scale=layer.scaling,
-                        causal=True,
-                        k_descale=fa_k_descale,
-                        v_descale=fa_v_descale,
-                        return_softmax_lse=forward_batch.mha_return_lse,
-                        out=_fa_out,
-                        ver=self.fa_impl_ver,
-                        **kwargs,
-                    )
+                    cp_varlen_mode = None
+                    local_q_num_tokens = q.shape[0]
+                    if _is_hcu and is_cp_v2_active(forward_batch):
+                        use_compact_ring = bool(
+                            getattr(
+                                forward_batch,
+                                "mla_cp_hcu_ring_active",
+                                False,
+                            )
+                        )
+                        assert not forward_batch.mha_return_lse
+                        k = k.contiguous().view(
+                            -1, layer.tp_k_head_num, layer.head_dim
+                        )
+                        v = v.contiguous().view(
+                            -1, layer.tp_k_head_num, layer.v_head_dim
+                        )
+                        cp_meta = forward_batch.attn_cp_metadata
+                        logical_q_tokens = (
+                            cp_meta.total_q_prev_tokens
+                            + cp_meta.total_q_next_tokens
+                        )
+                        q = q.contiguous().view(
+                            -1, layer.tp_q_head_num, layer.head_dim
+                        )[:logical_q_tokens]
+                        if not use_compact_ring:
+                            raise RuntimeError(
+                                "HCU MLA prefill CP requires compact-ring; "
+                                "the legacy expanded full-KV/local-Q path "
+                                "has been removed."
+                            )
+                        cp_varlen_mode = "compact-ring"
+                    else:
+                        cu_seqlens_q_cp = metadata.cu_seqlens_q
+                        cu_seqlens_k_cp = (
+                            metadata.cu_seqlens_q
+                            if not forward_batch.mha_one_shot
+                            else metadata.cu_seqlens_k
+                        )
+                        max_seqlen_q_cp = metadata.max_seq_len_q
+                        max_seqlen_k_cp = (
+                            metadata.max_seq_len_q
+                            if not forward_batch.mha_one_shot
+                            else metadata.max_seq_len_k
+                        )
+                    def _run_hcu_mla_varlen(
+                        q_arg,
+                        k_arg,
+                        v_arg,
+                        cu_seqlens_q_arg,
+                        cu_seqlens_k_arg,
+                        max_seqlen_q_arg,
+                        max_seqlen_k_arg,
+                        out_arg,
+                        *,
+                        causal_arg=True,
+                        return_lse_arg=None,
+                    ):
+                        # FlashAttention's varlen interface requires both
+                        # cumulative-length tensors to be int32.
+                        cu_seqlens_q_arg = cu_seqlens_q_arg.to(
+                            device=q_arg.device, dtype=torch.int32
+                        )
+                        cu_seqlens_k_arg = cu_seqlens_k_arg.to(
+                            device=k_arg.device, dtype=torch.int32
+                        )
+                        k_arg = (
+                            k_arg.to(self.kv_cache_dtype)
+                            if is_nmz_fp8(self.kv_cache_dtype)
+                            else k_arg
+                        )
+                        v_arg = (
+                            v_arg.to(self.kv_cache_dtype)
+                            if is_nmz_fp8(self.kv_cache_dtype)
+                            else v_arg
+                        )
+                        return flash_attn_varlen_func(
+                            q=q_arg.view(
+                                -1, layer.tp_q_head_num, layer.head_dim
+                            ),
+                            k=k_arg.view(
+                                -1, layer.tp_k_head_num, layer.head_dim
+                            ),
+                            v=v_arg.view(
+                                -1, layer.tp_k_head_num, layer.v_head_dim
+                            ),
+                            cu_seqlens_q=cu_seqlens_q_arg,
+                            cu_seqlens_k=cu_seqlens_k_arg,
+                            max_seqlen_q=max_seqlen_q_arg,
+                            max_seqlen_k=max_seqlen_k_arg,
+                            softmax_scale=layer.scaling,
+                            causal=causal_arg,
+                            k_descale=fa_k_descale,
+                            v_descale=fa_v_descale,
+                            return_softmax_lse=(
+                                forward_batch.mha_return_lse
+                                if return_lse_arg is None
+                                else return_lse_arg
+                            ),
+                            out=out_arg,
+                            ver=self.fa_impl_ver,
+                            **kwargs,
+                        )
+
+                    if cp_varlen_mode == "compact-ring":
+                        # A CP8 MLA layer launches several varlen rectangles.
+                        # Recreating these tiny device tensors for every
+                        # rectangle and every layer turns into hundreds of
+                        # synchronous H2D copies. The tensors depend only on
+                        # lengths and device, so retain them across layers and
+                        # chunked-prefill ForwardBatch instances.
+                        def _run_ring_segment(
+                            q_part,
+                            k_part,
+                            v_part,
+                            q_lens,
+                            kv_lens,
+                            *,
+                            causal,
+                        ):
+                            cu_q = _get_hcu_mla_cp_ring_cu_seqlens(
+                                tuple(int(x) for x in q_lens), q_part.device
+                            )
+                            cu_k = _get_hcu_mla_cp_ring_cu_seqlens(
+                                tuple(int(x) for x in kv_lens), k_part.device
+                            )
+                            result = _run_hcu_mla_varlen(
+                                q_part,
+                                k_part,
+                                v_part,
+                                cu_q,
+                                cu_k,
+                                max(q_lens, default=0),
+                                max(kv_lens, default=0),
+                                None,
+                                causal_arg=causal,
+                                return_lse_arg=True,
+                            )
+                            segment_output, segment_lse, *_ = result
+                            return segment_output, segment_lse.T.contiguous()
+
+                        try:
+                            output = run_hcu_mla_cp_ring(
+                                q,
+                                k,
+                                v,
+                                forward_batch,
+                                layer,
+                                self.token_to_kv_pool,
+                                run_segment=_run_ring_segment,
+                                merge_segment=merge_state_v2_wrapper,
+                            )
+                        finally:
+                            clear_hcu_mla_cp_ring_state(forward_batch)
+                    else:
+                        output = _run_hcu_mla_varlen(
+                            q,
+                            k,
+                            v,
+                            cu_seqlens_q_cp,
+                            cu_seqlens_k_cp,
+                            max_seqlen_q_cp,
+                            max_seqlen_k_cp,
+                            _fa_out,
+                        )
+                    if (
+                        cp_varlen_mode == "compact-ring"
+                        and output.shape[0] < local_q_num_tokens
+                    ):
+                        output = torch.cat(
+                            [
+                                output,
+                                output.new_zeros(
+                                    local_q_num_tokens - output.shape[0],
+                                    *output.shape[1:],
+                                ),
+                            ],
+                            dim=0,
+                        )
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
                     lse = torch.transpose(lse, 0, 1).contiguous()
@@ -1778,7 +1957,6 @@ class FlashAttentionBackend(AttentionBackend):
                         not use_cascade_attn
                     ), "Cascade attention under MLA CP is not supported in v1."
                     q_fused = torch.cat([q_nope, q_rope], dim=-1)
-
                     def _mla_cp_attn(
                         q_chunk,
                         cu_seqlens_q_cp,
@@ -1787,7 +1965,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ):
                         q_nope_chunk = q_chunk[..., : layer.v_head_dim]
                         q_rope_chunk = q_chunk[..., layer.v_head_dim :]
-                        return flash_attn_with_kvcache(
+                        cp_output = flash_attn_with_kvcache(
                             q=q_rope_chunk,
                             qv=q_nope_chunk,
                             k_cache=k_rope_cache,
@@ -1806,6 +1984,13 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=fa_v_descale,
                             num_splits=self.num_splits,
                             ver=self.fa_impl_ver,
+                        )
+                        # HCU MLA returns a padded batched layout
+                        # [batch, max_seqlen_q, heads, v_dim], while the CP
+                        # strategy concatenates token-major prev/next halves.
+                        # Normalize both HCU and CUDA-style outputs here.
+                        return cp_output.view(
+                            -1, layer.tp_q_head_num, layer.v_head_dim
                         )
 
                     if is_cp_v2_active(forward_batch):

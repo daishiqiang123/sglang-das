@@ -464,6 +464,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    # Kimi-K3 PCP policy latched from this replica's real local batch.
+    local_prefill_cp_active: Optional[bool] = None
+    # HCU MLA compact-ring state. These tensors are populated by the MLA
+    # prepare phase for one layer and cleared by the attention backend.
+    mla_cp_hcu_ring_active: bool = False
+    mla_cp_local_k: Optional[torch.Tensor] = None
+    mla_cp_local_k_rope: Optional[torch.Tensor] = None
+    mla_cp_prefix_k: Optional[torch.Tensor] = None
+    mla_cp_prefix_k_rope: Optional[torch.Tensor] = None
+    # Cache-slot validation is shared by all KDA layers in this forward.
+    kda_cp_cache_indices_validated: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -847,6 +858,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
+            local_prefill_cp_active=batch.local_prefill_cp_active,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,

@@ -158,7 +158,10 @@ class SchedulerRequestReceiver:
                 work_reqs = None
                 control_reqs = None
 
-            if self.ps.attn_tp_size != 1:
+            # Only CP rank 0 owns the tokenizer/controller payload before the
+            # CP fan-out.  Broadcasting inside every attention-TP slice makes
+            # the CP>0 slice source call broadcast_pyobj(None).
+            if self.ps.attn_tp_size != 1 and self.ps.attn_cp_rank == 0:
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_tp_group.rank,
@@ -184,7 +187,7 @@ class SchedulerRequestReceiver:
                 or is_ep_scale_joiner()
             )
             if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
+                if self.ps.attn_tp_size != 1 and self.ps.attn_cp_rank == 0:
                     control_reqs = broadcast_pyobj(
                         control_reqs,
                         self.attn_tp_group.rank,

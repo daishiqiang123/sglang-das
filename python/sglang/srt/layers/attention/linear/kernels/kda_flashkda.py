@@ -120,14 +120,12 @@ class FlashKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # The fused kernel cannot expose per-chunk states (h), which the mamba
-        # radix extra_buffer track path needs; route tracked batches through
-        # the Triton chunk_kda fallback instead of silently skipping the
-        # snapshot (that would corrupt prefix-cache restores).
-        # if return_intermediate_states or self._should_fall_back(
-        #     lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
-        # ):
-        if return_intermediate_states: # not fall back when _should_fall_back is true
+        # Correctness: use Triton whenever FlashKDA's bounded-gate/state
+        # contract is not applicable. The unbounded-gate HCU gate A/B is gated
+        # separately in chunk_kda; this keeps the public fallback contract.
+        if return_intermediate_states or self._should_fall_back(
+            lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
+        ):
             logger.info("FlashKDA prefill fall back to Triton chunk_kda")
             return _triton_fallback(
                 q,
@@ -229,7 +227,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # prefill path, but flash_kda expects beta LOGITS (it sigmoids
         # internally). Invert back so the kernel recovers the intended value:
         # sigmoid(logit(p)) == p. (triton/cuLA consume the post-sigmoid beta.)
-        beta = torch.logit(beta.float().clamp_(1e-7, 1.0 - 1e-7)).to(torch.bfloat16)
+        beta = torch.logit(beta.float().clamp(1e-7, 1.0 - 1e-7)).to(torch.bfloat16)
         beta = beta.contiguous()
 
         # flash_kda wants A_log [H] fp32 and dt_bias [H, K] fp32. The model
