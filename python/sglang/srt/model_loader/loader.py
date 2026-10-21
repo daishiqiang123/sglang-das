@@ -1051,7 +1051,15 @@ class DefaultModelLoader(BaseModelLoader):
             and not quant_config.is_checkpoint_nvfp4_serialized
         )
         is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
-        if is_mxfp8:
+        # M3.1 native NVFP4 expert scales must not receive the MXFP8 _inv rename.
+        if getattr(quant_config, "hcu_native_dequant", False) and getattr(
+            quant_config, "hcu_nvfp4_moe", False
+        ):
+            from sglang.srt.layers.quantization.hcu_minimax_native import remap_native_minimax_weights
+
+            weights = remap_native_minimax_weights(weights)
+        # Original generic MXFP8 rename retained for all other formats/backends.
+        elif is_mxfp8:
             weights = (
                 (
                     f"{name}_inv" if name.endswith(".weight_scale") else name,

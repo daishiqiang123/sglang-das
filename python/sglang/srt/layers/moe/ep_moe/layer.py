@@ -1514,7 +1514,23 @@ class DeepEPMoE(FusedMoE):
             )
             del a_int8, a_scale
 
-            if self.moe_runner_config.activation == "situ":
+            if (
+                self.moe_runner_config.activation == "silu"
+                and self.moe_runner_config.gemm1_alpha is not None
+                and self.moe_runner_config.gemm1_beta is not None
+                and not self.moe_runner_config.gate_up_interleaved
+            ):
+                from sglang.kernels.ops.activation.swiglu_oai_int8_quant import (
+                    swiglu_oai_int8_quant,
+                )
+
+                q_a2_all, q_a2_scale = swiglu_oai_int8_quant(
+                    gateup_output,
+                    alpha=self.moe_runner_config.gemm1_alpha,
+                    beta=self.moe_runner_config.gemm1_beta,
+                    limit=self.moe_runner_config.gemm1_clamp_limit,
+                )
+            elif self.moe_runner_config.activation == "situ":
                 q_a2_all, q_a2_scale = fuse_situ_mul_quant(
                     gateup_output,
                     self.moe_runner_config.gemm1_alpha,
@@ -1560,6 +1576,17 @@ class DeepEPMoE(FusedMoE):
             )
             del down_output
             return gather_out
+
+        if (
+            self.moe_runner_config.activation == "silu"
+            and self.moe_runner_config.gemm1_alpha is not None
+            and self.moe_runner_config.gemm1_beta is not None
+            and not self.moe_runner_config.gate_up_interleaved
+        ):
+            raise NotImplementedError(
+                "Split SwiGLU-OAI W4A8 normal dispatch requires the HIPC "
+                "activation path (SGLANG_USE_W4A8_CONTIGUOUS_HIPC=1)."
+            )
 
         all_tokens = sum(num_recv_tokens_per_expert)
 
@@ -2285,7 +2312,24 @@ class DeepEPMoE(FusedMoE):
 
         # Kimi K3 uses SiTU, not SiLU. Keep the original SiLU path intact for
         # other models and use the correctness-first Triton INT8 op only here.
-        if self.moe_runner_config.activation == "situ":
+        if (
+            self.moe_runner_config.activation == "silu"
+            and self.moe_runner_config.gemm1_alpha is not None
+            and self.moe_runner_config.gemm1_beta is not None
+            and not self.moe_runner_config.gate_up_interleaved
+        ):
+            from sglang.kernels.ops.activation.swiglu_oai_int8_quant import (
+                swiglu_oai_int8_quant,
+            )
+
+            q_a2_all, q_a2_scale = swiglu_oai_int8_quant(
+                gateup_output,
+                alpha=self.moe_runner_config.gemm1_alpha,
+                beta=self.moe_runner_config.gemm1_beta,
+                limit=self.moe_runner_config.gemm1_clamp_limit,
+                tokens_per_expert=masked_m,
+            )
+        elif self.moe_runner_config.activation == "situ":
             q_a2_all, q_a2_scale = torch.ops.sglang.fuse_situ_mul_quant_ep(
                 gateup_output,
                 masked_m,

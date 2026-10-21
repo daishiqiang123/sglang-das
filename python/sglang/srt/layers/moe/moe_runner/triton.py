@@ -65,6 +65,8 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
+    w13_global_scale: Optional[torch.Tensor] = None
+    w2_global_scale: Optional[torch.Tensor] = None
     w13_zp: Optional[torch.Tensor] = None
     w2_zp: Optional[torch.Tensor] = None
     a13_scale: Optional[torch.Tensor] = None
@@ -177,6 +179,8 @@ class TritonRunnerCore(MoeRunnerCore):
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            w1_global_scale=quant_info.w13_global_scale,
+            w2_global_scale=quant_info.w2_global_scale,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -266,6 +270,8 @@ def fused_experts_none_to_triton(
             block_shape=quant_info.block_shape,
             a1_q=a1_q,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            w1_global_scale=quant_info.w13_global_scale,
+            w2_global_scale=quant_info.w2_global_scale,
         )
 
     return StandardCombineInput(

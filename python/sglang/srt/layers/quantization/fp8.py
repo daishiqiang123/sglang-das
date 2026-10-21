@@ -279,6 +279,7 @@ class Fp8Config(QuantizationConfig):
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
         scale_fmt: Optional[str] = None,
+        hcu_nvfp4_moe: bool = False,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -303,6 +304,14 @@ class Fp8Config(QuantizationConfig):
             )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
+        # Explicit compatibility path for mixed MXFP8/NVFP4 source checkpoints.
+        self.hcu_native_dequant = (
+            use_mxfp8
+            and hcu_nvfp4_moe
+            and _is_hcu
+            and get_bool_env_var("SGLANG_HCU_M3_NATIVE_DEQUANT")
+        )
+        self.hcu_nvfp4_moe = hcu_nvfp4_moe
         self.kv_cache_quant_algo = kv_cache_quant_algo
         # "ue8m0" checkpoints quantize activations with power-of-two scales.
         self.scale_fmt = scale_fmt
@@ -334,6 +343,8 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
+        if self.hcu_native_dequant:
+            return 93  # gfx938 BF16 MMAC after source-weight dequantization.
         if is_npu():
             return 0  # NPU bypasses CUDA capability checks
         if _is_musa:
@@ -391,6 +402,11 @@ class Fp8Config(QuantizationConfig):
             use_mxfp8=use_mxfp8,
             kv_cache_quant_algo=kv_cache_quant_algo,
             scale_fmt=scale_fmt,
+            hcu_nvfp4_moe=(
+                str(config.get("moe_quant_algo", "")).upper() == "NVFP4"
+                and config.get("moe_quant_format") == "nvfp4-pack-quantized"
+                and config.get("group_size") == 16
+            ),
         )
 
     def get_quant_method(
@@ -405,6 +421,10 @@ class Fp8Config(QuantizationConfig):
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
                 return UnquantizedLinearMethod()
+            if self.hcu_native_dequant:
+                from sglang.srt.layers.quantization.hcu_minimax_native import HcuMxfp8LinearMethod
+
+                return HcuMxfp8LinearMethod(self)
             if is_npu() and self.use_mxfp8:
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
                     NPUMXFP8LinearMethod,
@@ -419,6 +439,13 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod(
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
+
+            if self.hcu_native_dequant:
+                from sglang.srt.layers.quantization.hcu_minimax_native import (
+                    HcuNvfp4MoEMethod,
+                )
+
+                return HcuNvfp4MoEMethod()
 
             if is_npu() and self.use_mxfp8:
                 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (

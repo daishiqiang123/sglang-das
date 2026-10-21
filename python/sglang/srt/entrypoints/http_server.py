@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
 from http import HTTPStatus
@@ -2374,6 +2375,41 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _send_dp_attention_warmup_requests(url, json_data, num_dp_ranks, **request_kwargs):
+    """Send one schema-valid warmup request to every DP rank concurrently."""
+
+    def send_request(dp_rank):
+        payload = dict(json_data, routed_dp_rank=dp_rank)
+        for key in ("text", "input_ids", "input_embeds"):
+            value = payload.get(key)
+            if not isinstance(value, list) or not value:
+                continue
+            if key == "text":
+                is_batch = True
+            elif key == "input_ids":
+                is_batch = isinstance(value[0], list)
+            else:
+                is_batch = (
+                    isinstance(value[0], list)
+                    and bool(value[0])
+                    and isinstance(value[0][0], list)
+                )
+            if is_batch:
+                if len(value) != num_dp_ranks:
+                    raise ValueError("DP warmup input batch must match the DP rank count")
+                payload[key] = value[dp_rank]
+        response = requests.post(url, json=payload, **request_kwargs)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"DP-attention warmup failed for rank {dp_rank}: "
+                f"{response.status_code} {response.text}"
+            )
+        return response
+
+    with ThreadPoolExecutor(max_workers=num_dp_ranks) as executor:
+        return list(executor.map(send_request, range(num_dp_ranks)))
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2533,15 +2569,14 @@ def _execute_server_warmup(server_args: ServerArgs):
     try:
         if get_disagg().disaggregation_mode == "null":
             if dp_attention_fanout:
-                json_data["routed_dp_rank"] = list(range(get_parallel().num_dp_ranks))
-                res = requests.post(
+                _send_dp_attention_warmup_requests(
                     url + request_name,
-                    json=json_data,
+                    json_data,
+                    get_parallel().num_dp_ranks,
                     headers=headers,
                     timeout=warmup_timeout if warmup_timeout > 0 else 600,
                     verify=ssl_verify,
                 )
-                assert res.status_code == 200, f"{res.text}"
                 logger.info(
                     "DP-attention warmup requests completed for all %s DP ranks",
                     get_parallel().num_dp_ranks,

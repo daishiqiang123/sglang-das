@@ -125,6 +125,7 @@ def fused_moe_kernel_gptq_awq(
     c_ptr,
     b_scale_ptr,
     b_zp_ptr,
+    b_global_scale_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -152,6 +153,9 @@ def fused_moe_kernel_gptq_awq(
     stride_bzk,
     stride_bzn,
     group_size: tl.constexpr,
+    nvfp4_compact_scales: tl.constexpr,
+    stride_bge: tl.constexpr,
+    global_scale_row_split: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -332,7 +336,22 @@ def fused_moe_kernel_gptq_awq(
             + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
         )
         b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        if use_mxfp4_w4a16 or use_mxfp4_w4a8:
+        if nvfp4_compact_scales:
+            # Preserve source E4M3 bytes and divide by the per-matrix global
+            # scale in registers. No resident FP32 group-scale expansion.
+            raw = b_scale.to(tl.int32)
+            exp, mant = (raw >> 3) & 15, raw & 7
+            normal = (((exp + 120) << 23) | (mant << 20)).to(tl.float32, bitcast=True)
+            magnitude = tl.where(exp == 0, mant.to(tl.float32) * 0.001953125, normal)
+            b_scale = tl.where((raw & 128) != 0, -magnitude, magnitude)
+            b_scale = tl.where((exp == 15) & (mant == 7), float("nan"), b_scale)
+            # w13 has distinct gate/up globals, while w2 has one per expert.
+            global_index = offs_bn // global_scale_row_split
+            global_scale = tl.load(
+                b_global_scale_ptr + off_experts * stride_bge + global_index
+            ).to(tl.float32)
+            b_scale = tl.div_rn(b_scale, global_scale[None, :])
+        elif (use_mxfp4_w4a16 or use_mxfp4_w4a8) and b_scale_ptr.dtype.element_ty == tl.uint8:
             # The checkpoint scale byte is OCP UE8M0 with exponent bias 127.
             # 2^(E-127) is exactly the BF16 bit pattern E << 7 (sign 0,
             # exponent E, mantissa 0), so a single shift + bitcast replaces
@@ -370,8 +389,12 @@ def fused_moe_kernel_gptq_awq(
         if has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
         elif use_mxfp4_w4a16:
-            # WFP4 A16: dequantize E2M1 x UE8M0 directly in BF16.
-            b = b * b_scale
+            # Original MXFP4: b = b * b_scale (BF16 UE8M0 scale).
+            # M3.1 NVFP4: FP32 E4M3/global group-16 scale, then BF16 for MMAC.
+            if b_scale_ptr.dtype.element_ty == tl.uint8 and not nvfp4_compact_scales:
+                b = b * b_scale
+            else:
+                b = (b.to(tl.float32) * b_scale).to(compute_type)
         elif use_mxfp4_w4a8:
             # WFP4 A8: keep the BF16 E2M1 magnitude; the UE8M0 group scale is
             # applied after the FP8 MMAC below.
@@ -951,6 +974,7 @@ def invoke_fused_moe_kernel(
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
     use_int4_w4a8: bool = False,
+    B_global_scale: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -1073,10 +1097,20 @@ def invoke_fused_moe_kernel(
             assert not use_int4_w4a16 and not use_int4_w4a8, (
                 "MXFP4 and affine INT4 modes are exclusive"
             )
-            assert B_scale is not None and B_scale.dtype == torch.uint8, (
-                "MXFP4 requires uint8 UE8M0 scales"
+            # Original MXFP4 required only uint8 UE8M0. M3.1's native NVFP4
+            # shares E2M1 nibble decoding and provides FP32 group-16 scales.
+            assert B_scale is not None and (
+                B_scale.dtype == torch.uint8
+                or (use_mxfp4_w4a16 and B_scale.dtype == torch.float32 and block_shape[1] == 16)
+            ), (
+                "E2M1 requires uint8 UE8M0 or NVFP4 FP32 group-16 scales"
             )
             assert B_zp is None, "MXFP4 E2M1 does not use an affine zero point"
+            if B_global_scale is not None:
+                assert use_mxfp4_w4a16 and not use_mxfp4_w4a8
+                assert B_scale.dtype == torch.uint8 and block_shape[1] == 16
+                assert B_global_scale.dtype == torch.float32 and B_global_scale.is_contiguous()
+                assert B_global_scale.shape in ((B.shape[0],), (B.shape[0], 2))
         if use_int4_w4a8:
             assert B_zp is None, "INT4 W4A8 does not use an affine zero point"
         if use_mxfp4_w4a8:
@@ -1098,6 +1132,7 @@ def invoke_fused_moe_kernel(
             C,
             B_scale,
             B_zp,
+            B_global_scale,
             topk_weights,
             sorted_token_ids,
             expert_ids,
@@ -1120,6 +1155,13 @@ def invoke_fused_moe_kernel(
             B_zp.stride(2) if B_zp is not None else 0,
             B_zp.stride(1) if B_zp is not None else 0,
             group_size=block_shape[1],
+            nvfp4_compact_scales=B_global_scale is not None,
+            stride_bge=B_global_scale.stride(0) if B_global_scale is not None else 0,
+            global_scale_row_split=(
+                B.shape[1] // B_global_scale.shape[1]
+                if B_global_scale is not None and B_global_scale.ndim == 2
+                else B.shape[1]
+            ),
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,

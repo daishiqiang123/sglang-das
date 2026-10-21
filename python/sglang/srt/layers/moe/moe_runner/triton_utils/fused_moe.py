@@ -239,6 +239,8 @@ def inplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
 ) -> None:
     if isinstance(activation, int):
         if activation == 0:
@@ -283,6 +285,8 @@ def inplace_fused_experts(
         a1_q=a1_q,
         use_int4_w4a8=use_int4_w4a8,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
 
 
@@ -315,6 +319,8 @@ def inplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
 ) -> None:
     pass
 
@@ -363,6 +369,8 @@ def outplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if isinstance(activation, int):
         if activation == 0:
@@ -407,6 +415,8 @@ def outplace_fused_experts(
         a1_q=a1_q,
         use_int4_w4a8=use_int4_w4a8,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
 
 
@@ -440,6 +450,8 @@ def outplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -477,6 +489,8 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -535,6 +549,8 @@ def fused_experts(
             a1_q=a1_q,
             use_int4_w4a8=use_int4_w4a8,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            w1_global_scale=w1_global_scale,
+            w2_global_scale=w2_global_scale,
         )
         return hidden_states
     else:
@@ -573,6 +589,8 @@ def fused_experts(
             a1_q=a1_q,
             use_int4_w4a8=use_int4_w4a8,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            w1_global_scale=w1_global_scale,
+            w2_global_scale=w2_global_scale,
         )
 
 
@@ -961,6 +979,8 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -1098,6 +1118,7 @@ def _fused_moe_kernel_sequence(
         b_use_tma=up_moe_use_tma,
         filter_expert=filter_expert,
         fuse_swiglu=fuse_swiglu_interleaved,
+        B_global_scale=w1_global_scale,
     )
 
     if hooks and hooks.after_gate_up:
@@ -1347,6 +1368,7 @@ def _fused_moe_kernel_sequence(
         filter_expert=filter_expert,
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,
+        B_global_scale=w2_global_scale,
     )
 
     if hooks and hooks.after_down:
@@ -1481,11 +1503,20 @@ def fused_experts_impl(
     a1_q: Optional[torch.Tensor] = None,
     use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
 ):
     if (
         _use_aiter_moe
         # HCU INT8 fallback requires raw weights and Triton's swiglu_limit.
         and not (_is_hcu and use_int8_w8a8)
+        # Source NVFP4 uses Triton's E2M1 decoder and its exact scale format.
+        and w1_global_scale is None
+        and not (
+            use_mxfp4_w4a16
+            and w1_scale is not None
+            and w1_scale.dtype != torch.uint8
+        )
         and not is_triton_forced_for_dspark_aiter_fallback()
         # AITER expects a complete expert weight set. EP-local shards keep
         # global expert ids and require Triton's filter_expert path.
@@ -1634,6 +1665,8 @@ def fused_experts_impl(
         a1_q=a1_q,
         use_int4_w4a8=use_int4_w4a8,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
 
 
@@ -1659,6 +1692,8 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1753,6 +1788,8 @@ def fused_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
 
 

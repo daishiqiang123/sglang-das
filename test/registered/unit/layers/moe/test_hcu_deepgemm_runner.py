@@ -160,13 +160,17 @@ def test_hcu_deepgemm_breakable_capture_stub_preserves_ll_layout():
 def test_hcu_deepgemm_breakable_routes_only_moe_core(monkeypatch):
     sentinel = object()
     dispatch_output = SimpleNamespace()
+    quant_config = object()
     layer = SimpleNamespace(
         deprecate_flag=True,
+        quant_config=quant_config,
         hcu_ll_moe_core=lambda value: sentinel if value is dispatch_output else None,
     )
     monkeypatch.setattr(ep_moe_layer, "is_in_breakable_cuda_graph", lambda: True)
     monkeypatch.setattr(
-        ep_moe_layer, "_should_break_only_hcu_deepgemm_core", lambda: True
+        ep_moe_layer,
+        "_should_break_only_hcu_deepgemm_core",
+        lambda config: config is quant_config,
     )
 
     assert ep_moe_layer.DeepEPMoE.run_moe_core(layer, dispatch_output) is sentinel
