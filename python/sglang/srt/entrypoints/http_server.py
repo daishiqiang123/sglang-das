@@ -2568,7 +2568,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
-            if dp_attention_fanout:
+            if dp_attention_fanout and request_name in ("/generate", "/encode"):
                 _send_dp_attention_warmup_requests(
                     url + request_name,
                     json_data,

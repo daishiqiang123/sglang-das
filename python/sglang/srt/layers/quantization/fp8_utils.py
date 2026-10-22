@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from enum import Enum
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -2908,6 +2909,25 @@ def apply_fp8_lightop_channelwise_linear(
     if not _use_lightop_channel_fp8:
         raise RuntimeError(
             "SGLANG_USE_LIGHTOP_CHANNEL_FP8=1 is required for this FP8 path"
+        )
+
+    # An idle attention-DP rank has a genuine M=0 matrix. hipBLASLt
+    # rejects this shape even though its wrapper may return an empty tensor.
+    # Preserve leading dimensions/dtype and avoid quantizer/GEMM launches.
+    source = input[0] if isinstance(input, tuple) else input
+    if math.prod(source.shape[:-1]) == 0:
+        if weight.shape[1] != source.shape[-1]:
+            raise ValueError(
+                f"LightOp channel-FP8 expects weight [N,K], got {weight.shape} "
+                f"for input shape={source.shape}"
+            )
+        output_dtype = (
+            input[2] if len(input) > 2 else torch.bfloat16
+        ) if isinstance(input, tuple) else source.dtype
+        return torch.empty(
+            (*source.shape[:-1], weight.shape[0]),
+            dtype=output_dtype,
+            device=source.device,
         )
 
     if isinstance(input, tuple):
