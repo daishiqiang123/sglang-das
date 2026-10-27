@@ -16,6 +16,8 @@ register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 @pytest.fixture
 def layout_case(monkeypatch):
     monkeypatch.setenv("SGLANG_FORCE_AITER_MOE_C", "0")
+    monkeypatch.setattr(runner, "_is_hcu", True)
+    monkeypatch.setenv("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE", "0")
     monkeypatch.setattr(runner, "_AITER_UNIFIED_MOE_CONFIG_CACHE", {})
     monkeypatch.setattr(runner, "_AITER_UNIFIED_MOE_FALLBACK_WARNINGS", set())
     monkeypatch.setattr(runner, "_aiter_moe_c_has_exact_m", lambda *args: True)
@@ -26,6 +28,9 @@ def layout_case(monkeypatch):
     api = ModuleType("aiter.moe")
     api.MoeSolutionType = SimpleNamespace(ASM="asm", MOE_C="moe_c", TRITON="triton")
     api.AiterMoeConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    api.aiter_moe = lambda *, use_weight_shuffle=False, **kwargs: kwargs[
+        "hidden_states"
+    ]
 
     def get_config(**kwargs):
         state.config_calls.append(kwargs)
@@ -151,6 +156,7 @@ def test_ordinary_w8a8_unified_calls_reuse_model_storage(layout_case, dtype):
     assert calls["moe_config"].solution_type == "moe_c"
     assert calls["moe_config"].quant_type == quant_type
     assert calls["gemm1_alpha"] is None and calls["gemm1_limit"] == 10.0
+    assert "use_weight_shuffle" not in calls
     assert state.shuffle_calls == 1
     assert not core._unified_weight_cache
 
@@ -436,6 +442,100 @@ def test_legacy_graph_reads_live_storage_after_local_eplb_update(
     torch.testing.assert_close(output, torch.full_like(output, 16))
     assert (info.w13_weight.data_ptr(), info.w2_weight.data_ptr()) == pointers
     assert not core._unified_weight_cache
+
+
+@pytest.mark.parametrize(
+    "is_hcu,minimax,tp,ep,enabled,dtype,expected",
+    [
+        (True, True, 8, 1, True, torch.float8_e4m3fn, True),
+        (True, True, 8, 1, False, torch.float8_e4m3fn, False),
+        (False, True, 8, 1, True, torch.float8_e4m3fn, False),
+        (True, False, 8, 1, True, torch.float8_e4m3fn, False),
+        (True, True, 1, 1, True, torch.float8_e4m3fn, False),
+        (True, True, 1, 8, True, torch.float8_e4m3fn, False),
+        (True, True, 8, 8, True, torch.float8_e4m3fn, False),
+        (True, True, 8, 1, True, torch.int8, False),
+        (True, True, 8, 1, True, torch.bfloat16, False),
+    ],
+)
+def test_minimax_tp_packing_is_narrowly_opted_in(
+    layout_case, monkeypatch, is_hcu, minimax, tp, ep, enabled, dtype, expected
+):
+    core, _ = layout_case
+    core.config.is_minimax_m3 = minimax
+    monkeypatch.setattr(runner, "_is_hcu", is_hcu)
+    monkeypatch.setattr(
+        runner, "get_parallel", lambda: SimpleNamespace(moe_tp_size=tp, moe_ep_size=ep)
+    )
+    monkeypatch.setenv("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE", str(int(enabled)))
+    _, info, _ = tensors(dtype)
+    assert core._use_inplace_minimax_tp_weights(info) is expected
+
+
+def test_opted_in_minimax_tp_owns_one_packed_copy(layout_case, monkeypatch):
+    core, state = layout_case
+    core.config.is_minimax_m3 = True
+    monkeypatch.setattr(runner, "_is_hcu", True)
+    monkeypatch.setattr(
+        runner, "get_parallel", lambda: SimpleNamespace(moe_tp_size=8, moe_ep_size=1)
+    )
+    monkeypatch.setenv("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE", "1")
+    inputs, info, quant_type = tensors(torch.float8_e4m3fn)
+    config = core._get_unified_moe_config(inputs, info, quant_type, 0)
+    first = core._get_unified_weights(info, config)
+    second = core._get_unified_weights(info, config)
+    assert state.config_calls[0]["use_shuffle"] == 1
+    assert first[0].data_ptr() == second[0].data_ptr() == info.w13_weight.data_ptr()
+    assert first[1].data_ptr() == second[1].data_ptr() == info.w2_weight.data_ptr()
+    assert state.shuffle_calls == 1
+    assert not core._unified_weight_cache
+    incompatible = SimpleNamespace(
+        need_shuffle=False, solution_type="triton", quant_type=quant_type, config={}
+    )
+    with pytest.raises(RuntimeError, match="incompatible weight layout"):
+        core._get_unified_weights(info, incompatible)
+    monkeypatch.setenv("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE", "0")
+    with pytest.raises(RuntimeError, match="configuration cannot change"):
+        core._get_unified_weights(info, config)
+
+
+def test_opted_in_minimax_tp_cannot_pack_after_raw_capture(layout_case, monkeypatch):
+    core, state = layout_case
+    core.config.is_minimax_m3 = True
+    monkeypatch.setattr(runner, "_is_hcu", True)
+    monkeypatch.setattr(
+        runner, "get_parallel", lambda: SimpleNamespace(moe_tp_size=8, moe_ep_size=1)
+    )
+    monkeypatch.setenv("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE", "1")
+    _, info, quant_type = tensors(torch.float8_e4m3fn)
+    core._legacy_raw_graph_captured = True
+    config = SimpleNamespace(
+        need_shuffle=True, solution_type="moe_c", quant_type=quant_type, config={}
+    )
+    with pytest.raises(RuntimeError, match="before CUDA Graph capture"):
+        core._get_unified_weights(info, config)
+    assert state.shuffle_calls == 0
+
+
+def test_old_aiter_retains_minimax_cached_weights_with_shuffle_set(
+    layout_case, monkeypatch
+):
+    core, state = layout_case
+    core.config.is_minimax_m3 = True
+    monkeypatch.setattr(runner, "_is_hcu", True)
+    monkeypatch.setattr(
+        runner, "get_parallel", lambda: SimpleNamespace(moe_tp_size=8, moe_ep_size=1)
+    )
+    monkeypatch.setenv("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE", "1")
+    api = sys.modules["aiter.moe"]
+    api.aiter_moe = lambda **kwargs: kwargs["hidden_states"]
+    inputs, info, quant_type = tensors(torch.float8_e4m3fn)
+    assert not core._use_inplace_minimax_tp_weights(info)
+    config = core._get_unified_moe_config(inputs, info, quant_type, 0)
+    weights = core._get_unified_weights(info, config)
+    assert "use_shuffle" not in state.config_calls[0]
+    assert weights[0].data_ptr() != info.w13_weight.data_ptr()
+    assert core._legacy_weight_layout is None
 
 
 if __name__ == "__main__":
