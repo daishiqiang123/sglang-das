@@ -72,6 +72,29 @@ def _warn_gluon_fallback(msg: str) -> None:
     _gluon_fallback_warned = True
 
 
+def _flash_mla_prefill_index_view(page_table, safe_pages, max_seqlen_k, block_size):
+    """Bound eager prefill index workspace by its CPU-known live KV extent.
+
+    Decode graph callers retain the full context page table. Keep at least one
+    128-page selection tile so forced prefix pages and padding remain supported.
+    """
+    if not envs.SGLANG_MINIMAX_FLASH_MLA_PREFILL_LIVE_EXTENT.get():
+        return page_table, safe_pages
+    if max_seqlen_k <= 0:
+        return page_table, safe_pages
+    full_pages = page_table.shape[1]
+    live_pages = min(full_pages, max(128, (max_seqlen_k + block_size - 1) // block_size))
+    if live_pages == full_pages:
+        return page_table, safe_pages
+    bounded_table = page_table[:, :live_pages]
+    bounded_safe = (
+        safe_pages.reshape(page_table.shape)[:, :live_pages].contiguous().reshape(-1)
+        if safe_pages is not None
+        else None
+    )
+    return bounded_table, bounded_safe
+
+
 def minimax_sparse_prefill(
     q: torch.Tensor,  # [total_extend_tokens, num_q_heads, qk_head_dim]
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged main)
@@ -252,10 +275,13 @@ def minimax_sparse_prefill(
         from .flash_mla_gfx938 import flash_mla_sparse_prefill_indexer
 
         idx_o = None
+        index_page_table, index_safe_pages = _flash_mla_prefill_index_view(
+            flash_mla_page_table, flash_mla_safe_pages, max_seqlen_k, block_size_k
+        )
         topk_idx = flash_mla_sparse_prefill_indexer(
             idx_q,
             idx_k_cache,
-            flash_mla_page_table,
+            index_page_table,
             cu_seqlens,
             prefix_lens,
             seqlens_cpu,
@@ -264,7 +290,7 @@ def minimax_sparse_prefill(
             init_blocks,
             local_blocks,
             flash_mla_prefill_k_end,
-            flash_mla_safe_pages,
+            index_safe_pages,
         )
     else:
         if idx_q is None or idx_k_cache is None:
@@ -647,6 +673,7 @@ def minimax_sparse_decode(
             topk,
             init_blocks,
             local_blocks,
+            verify_group_size=verify_group_size,
         )
         real_seq_lens = seq_lens
     else:

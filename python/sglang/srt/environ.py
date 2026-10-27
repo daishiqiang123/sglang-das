@@ -2125,6 +2125,9 @@ class Envs:
     # Validated gfx938 FlashMLA MSA128 Stage-3 path. The MiniMax lightning
     # indexer remains the exact Top16 producer. The external kernels require
     # BF16 Q/K/V, page128, and attention TP1 (64Q:4KV heads).
+    # Bound only eager MiniMax FlashMLA prefill workspace; decode graph capacity
+    # and the visible KV contents are unchanged. Default off for other users.
+    SGLANG_MINIMAX_FLASH_MLA_PREFILL_LIVE_EXTENT = EnvBool(False)
     SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938 = EnvBool(False)
     # Also replace the MiniMax score producer and exact Top16 selector with
     # FlashMLA's MSA128 Stage-1/2 kernels. Kept separate from Stage-3 so each

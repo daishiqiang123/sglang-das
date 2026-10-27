@@ -180,7 +180,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "gfx938 Triton FP8 main attention keeps index-K in the "
                     "model dtype so sparse Top-K selection remains unchanged"
                 )
-        self.main_fp8_attn_gemm = self.fp8_attn_gemm or self.triton_fp8_main_attn_gemm
+        self.flash_mla_fp8_main_attn_gemm = (
+            _is_hcu
+            and envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938.get()
+            and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
+        )
+        self.main_fp8_attn_gemm = (
+            self.fp8_attn_gemm
+            or self.triton_fp8_main_attn_gemm
+            or self.flash_mla_fp8_main_attn_gemm
+        )
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
                 "fp8 attn-GEMM mode requires an fp8_e4m3fn main KV pool, got "
@@ -388,11 +397,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 contract_errors.append(
                     "installed flash_mla lacks usable gfx938 MSA128 kernels"
                 )
-            if self.fp8_attn_gemm:
-                contract_errors.append("FP8 attention GEMM must be disabled")
-            if self.kv_pool.main_pool.dtype != torch.bfloat16:
+            if self.use_flash_mla_gfx938_indexer and self.fp8_attn_gemm:
                 contract_errors.append(
-                    f"KV cache must be BF16, got {self.kv_pool.main_pool.dtype}"
+                    "FlashMLA Stage-1/2 requires BF16 index Q/K; use the "
+                    "MSA FP8 main-attention path without global FP8 indexer mode"
+                )
+            if self.kv_pool.main_pool.dtype not in (
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            ):
+                contract_errors.append(
+                    "KV cache must be BF16 or E4M3FN, got "
+                    f"{self.kv_pool.main_pool.dtype}"
                 )
             if self.block_size_k != 128 or self.kv_pool.page_size != 128:
                 contract_errors.append(
@@ -409,6 +425,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     f"Q{local_q_heads}/KV{local_kv_heads}"
                 )
             if self.use_flash_mla_gfx938_indexer:
+                if self.use_flash_mla_gfx938_decode:
+                    from .minimax_sparse_ops.flash_mla_gfx938 import (
+                        flash_mla_stage1_graph_available,
+                    )
+
+                    if not flash_mla_stage1_graph_available():
+                        contract_errors.append(
+                            "decode indexer requires capture-safe upstream Stage1 "
+                            "(max_kv_len interface); load the rebuilt FlashMLA wheel "
+                            "or disable the FlashMLA indexer"
+                        )
                 if self.score_type != "max":
                     contract_errors.append(
                         f"FlashMLA Stage-1/2 requires score_type=max, got {self.score_type}"
@@ -562,6 +589,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"msa_decode={self._use_msa_decode}, "
             f"flash_mla_decode={self.use_flash_mla_gfx938_decode}, "
             f"flash_mla_indexer={self.use_flash_mla_gfx938_indexer}, "
+            f"flash_mla_fp8_main={self.flash_mla_fp8_main_attn_gemm}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
             f"prefill_block_q={self.block_size_q}, "
