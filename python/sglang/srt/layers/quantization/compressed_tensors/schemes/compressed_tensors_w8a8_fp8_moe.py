@@ -87,6 +87,17 @@ def _should_use_aiter_runner() -> bool:
     )
 
 
+def _minimax_tp_runner_owns_pack(layer) -> bool:
+    # Keep the pre-existing scheme path for all callers outside this opt-in.
+    if not _should_use_aiter_runner():
+        return False
+    from sglang.srt.layers.moe.moe_runner.aiter import use_minimax_tp_inplace_weights
+
+    return use_minimax_tp_inplace_weights(
+        layer.moe_runner_config, layer.w13_weight.dtype
+    )
+
+
 def _hcu_aiter_fp8_noshuffle_supported(layer) -> bool:
     """Return True when the HCU aiter ASM table covers this FP8 MoE shape
     with ``use_shuffle=0``.
@@ -566,6 +577,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             and not self.use_hcu_fp8_w8a8_moe
             and _use_aiter_fp8_w8a8_moe
             and _use_shuffle
+            and not (
+                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and _minimax_tp_runner_owns_pack(layer)
+            )
         ):
             w13_weight = asm_shuffle_weight_b8(layer.w13_weight, 1)
             layer.w13_weight.copy_(w13_weight)

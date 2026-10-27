@@ -79,6 +79,34 @@ def _cpu_i32(values: tuple[int, ...]) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32)
 
 
+@functools.lru_cache(maxsize=None)
+def _fp8_scale_tensor(value: float, device: torch.device) -> torch.Tensor:
+    # Device fill is capture-safe even if a new immutable scale is first used
+    # during graph setup. Keep its address alive for all graph replays;
+    # a bounded cache could evict scales still referenced by a captured graph.
+    return torch.full((1,), value, dtype=torch.float32, device=device)
+
+
+def _fp8_scales(q, q_scale, k_scale, v_scale):
+    return dict(
+        q_scale=_fp8_scale_tensor(unit_scale(q_scale), q.device),
+        k_scale=_fp8_scale_tensor(unit_scale(k_scale), q.device),
+        v_scale=_fp8_scale_tensor(unit_scale(v_scale), q.device),
+        p_scale=_fp8_scale_tensor(1.0, q.device),
+    )
+
+
+def flash_mla_stage1_graph_available() -> bool:
+    """Require the upstream capture-safe Stage1 interface for decode graphs."""
+    import inspect
+
+    try:
+        *_, stage1, _ = _load_flash_mla()
+        return "max_kv_len" in inspect.signature(stage1).parameters
+    except (FlashMLAGfx938UnavailableError, TypeError, ValueError):
+        return False
+
+
 def _paged_index_k(k_cache: torch.Tensor, page_size: int) -> torch.Tensor:
     """Expose SGLang slot-major index K as FlashMLA Stage-1 paged K."""
     if k_cache.dim() != 3 or k_cache.shape[1:] != (1, 128):
@@ -200,6 +228,10 @@ def _run_flash_mla_indexer(
             "FlashMLA MSA128 cached safe-page metadata does not match the "
             "current page table"
         )
+    # These CPU lengths describe fixed graph capacities, never live request
+    # lengths. The upstream Stage1 materializes them with capture-safe fills;
+    # k_end and page-table contents remain live device inputs on each replay.
+    k_end_i32 = k_end.to(torch.int32).contiguous()
     score = stage1(
         q,
         _paged_index_k(k_cache, block_size),
@@ -207,17 +239,27 @@ def _run_flash_mla_indexer(
         _cpu_i32((fixed_k_len,) * len(q_lens)),
         causal=True,
         kv_indices=safe_pages,
-        k_end=k_end.to(torch.int32),
+        k_end=k_end_i32,
     )
-    _force_local_pages(score, k_end, block_size, local_blocks)
+    _force_local_pages(score, k_end_i32, block_size, local_blocks)
     # Stage-2 can force common prefix pages directly.  Local pages are
     # query-dependent and were marked above.
+    # Older FlashMLA wheels keep their original Stage2 interface. The rebuilt
+    # wheel explicitly advertises device-side bounds for small-query graphs.
+    from flash_mla import cuda as flash_mla_cuda
+
+    stage2_kwargs = (
+        dict(k_end=k_end_i32)
+        if getattr(flash_mla_cuda, "MSA128_STAGE2_LIVE_BOUNDS", False)
+        else {}
+    )
     selected = stage2(
         score,
         topk,
         num_valid_pages=max_pages,
         force_begin_blocks=init_blocks,
         force_end_blocks=0,
+        **stage2_kwargs,
     )
     # Preserve the established SGLang contract [index_head, query, TopK].
     return selected.permute(1, 0, 2)
@@ -307,12 +349,25 @@ def flash_mla_sparse_decode_indexer(
     topk: int,
     init_blocks: int,
     local_blocks: int,
+    verify_group_size: int = 1,
 ) -> torch.Tensor:
+    if not flash_mla_stage1_graph_available():
+        raise FlashMLAGfx938UnavailableError(
+            "FlashMLA decode indexer requires capture-safe upstream Stage1 "
+            "(max_kv_len interface); rebuild FlashMLA or disable its indexer"
+        )
+    rows = idx_q.shape[0]
+    if verify_group_size <= 0 or rows % verify_group_size:
+        raise FlashMLAGfx938UnavailableError(
+            f"FlashMLA indexer rows={rows} is incompatible with "
+            f"verify width={verify_group_size}"
+        )
+    q_lens = (verify_group_size,) * (rows // verify_group_size)
     return _run_flash_mla_indexer(
         q=idx_q,
         k_cache=idx_k_cache,
         page_table=page_table,
-        q_lens=(1,) * idx_q.shape[0],
+        q_lens=q_lens,
         k_end=seq_lens,
         block_size=block_size,
         topk=topk,
@@ -376,14 +431,14 @@ def _validate_contract(
         raise FlashMLAGfx938UnavailableError(
             "gfx938 flash_mla MSA128 kernels are unavailable"
         )
-    if q.dtype != torch.bfloat16:
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise FlashMLAGfx938UnavailableError(
-            f"gfx938 FlashMLA MSA128 requires BF16 Q, got {q.dtype}"
+            f"gfx938 FlashMLA MSA128 requires BF16 or E4M3FN Q, got {q.dtype}"
         )
-    if k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
+    if k_cache.dtype != q.dtype or v_cache.dtype != q.dtype:
         raise FlashMLAGfx938UnavailableError(
-            "gfx938 FlashMLA MSA128 currently requires BF16 K/V cache, got "
-            f"K={k_cache.dtype}, V={v_cache.dtype}"
+            "gfx938 FlashMLA MSA128 requires matching Q/K/V dtypes, got "
+            f"Q={q.dtype}, K={k_cache.dtype}, V={v_cache.dtype}"
         )
     if q.shape[-2:] != (64, 128):
         raise FlashMLAGfx938UnavailableError(
@@ -457,11 +512,11 @@ def flash_mla_sparse_prefill_main(
         output=indices_output,
         s_q_axis=0,
     )
-    scale = (
-        (128**-0.5 if sm_scale is None else sm_scale)
-        * unit_scale(q_scale)
-        * unit_scale(k_scale)
-    )
+    is_fp8 = q.dtype == torch.float8_e4m3fn
+    scale = 128**-0.5 if sm_scale is None else sm_scale
+    if not is_fp8:
+        scale *= unit_scale(q_scale) * unit_scale(k_scale)
+    fp8_scales = _fp8_scales(q, q_scale, k_scale, v_scale) if is_fp8 else {}
     output, _, _ = flash_mla_sparse_fwd(
         q,
         k_cache,
@@ -469,8 +524,10 @@ def flash_mla_sparse_prefill_main(
         sm_scale=scale,
         d_v=128,
         v=v_cache,
+        **fp8_scales,
     )
-    value_scale = unit_scale(v_scale)
+    # The FP8 native op already applies V dequantization.
+    value_scale = 1.0 if is_fp8 else unit_scale(v_scale)
     return output if value_scale == 1.0 else output * value_scale
 
 
@@ -525,7 +582,14 @@ def flash_mla_sparse_decode_main(
         .contiguous()
         .to(torch.int32)
     )
-    grouped_seq_lens = seq_lens.reshape(batch, verify_group_size).to(torch.int32)
+    # Expand accepts one final KV length per request. Its causal rule then
+    # derives prefix+i from final_length-verify_width+i. Passing [B,S] here
+    # makes the native kernel read the first B flattened values instead.
+    grouped_seq_lens = (
+        seq_lens.reshape(batch, verify_group_size)[:, -1]
+        .to(torch.int32)
+        .contiguous()
+    )
     indices = expand(
         blocks,
         causal=True,
@@ -537,11 +601,11 @@ def flash_mla_sparse_decode_main(
     num_pages = k_cache.shape[0] // block_size_k
     k_paged = k_cache.view(num_pages, block_size_k, 4, 128)
     v_paged = v_cache.view(num_pages, block_size_k, 4, 128)
-    scale = (
-        (128**-0.5 if sm_scale is None else sm_scale)
-        * unit_scale(q_scale)
-        * unit_scale(k_scale)
-    )
+    is_fp8 = q.dtype == torch.float8_e4m3fn
+    scale = 128**-0.5 if sm_scale is None else sm_scale
+    if not is_fp8:
+        scale *= unit_scale(q_scale) * unit_scale(k_scale)
+    fp8_scales = _fp8_scales(q, q_scale, k_scale, v_scale) if is_fp8 else {}
     output, _ = flash_mla_with_kvcache(
         q_grouped,
         k_paged,
@@ -551,10 +615,11 @@ def flash_mla_sparse_decode_main(
         sched_meta,
         softmax_scale=scale,
         causal=False,
-        is_fp8_kvcache=False,
+        is_fp8_kvcache=is_fp8,
         indices=indices,
         v_cache=v_paged,
+        **fp8_scales,
     )
     output = output.reshape(rows, 64, 128)
-    value_scale = unit_scale(v_scale)
+    value_scale = 1.0 if is_fp8 else unit_scale(v_scale)
     return output if value_scale == 1.0 else output * value_scale

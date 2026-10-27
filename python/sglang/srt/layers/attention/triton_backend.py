@@ -124,6 +124,8 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
     architectures = getattr(model_config.hf_config, "architectures", ()) or ()
+    if "DSparkMiniMaxDraftModel" in architectures:
+        return use_verify_splitkv and envs.SGLANG_MINIMAX_M31_DRAFT_SPLITKV.get()
     is_minimax_m3 = any(
         arch
         in (
@@ -315,6 +317,12 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # M3.1's draft is causal sliding-window GQA. Keep other models' SWA
+        # fallback unchanged while this scoped path is being validated.
+        self.use_m31_draft_splitkv = self.use_verify_shared_kv and (
+            "DSparkMiniMaxDraftModel"
+            in (getattr(model_runner.model_config.hf_config, "architectures", ()) or ())
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -2001,7 +2009,14 @@ class TritonAttnBackend(AttentionBackend):
                 xai_temperature_len=layer.xai_temperature_len,
                 max_bs=self.req_to_token_pool.size,
                 # Grouped verify addresses the physical paged KV layout.
-                **({"page_size": self.page_size} if self.use_verify_shared_kv else {}),
+                **(
+                    {
+                        "page_size": self.page_size,
+                        "allow_sliding_window": self.use_m31_draft_splitkv,
+                    }
+                    if self.use_verify_shared_kv
+                    else {}
+                ),
             )
         ):
             return o

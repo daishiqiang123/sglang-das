@@ -1608,6 +1608,8 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Opt-in M3.1 DSpark draft GQA sliding-window grouped split-KV.
+    SGLANG_MINIMAX_M31_DRAFT_SPLITKV = EnvBool(False)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
     # ===================================================================
@@ -2123,6 +2125,9 @@ class Envs:
     # Validated gfx938 FlashMLA MSA128 Stage-3 path. The MiniMax lightning
     # indexer remains the exact Top16 producer. The external kernels require
     # BF16 Q/K/V, page128, and attention TP1 (64Q:4KV heads).
+    # Bound only eager MiniMax FlashMLA prefill workspace; decode graph capacity
+    # and the visible KV contents are unchanged. Default off for other users.
+    SGLANG_MINIMAX_FLASH_MLA_PREFILL_LIVE_EXTENT = EnvBool(False)
     SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938 = EnvBool(False)
     # Also replace the MiniMax score producer and exact Top16 selector with
     # FlashMLA's MSA128 Stage-1/2 kernels. Kept separate from Stage-3 so each
@@ -2138,6 +2143,10 @@ class Envs:
     # Validated gfx938 native E4M3FN MFMA path for MiniMax sparse main
     # attention. Index Q/K remain BF16 so Top-K selection is unchanged.
     SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM = EnvBool(False)
+    # HCU OAI SwiGLU with FP32 intermediates and per-row E4M3FN
+    # activation quantization. Standard SiLU and unsupported layouts keep
+    # the existing Triton path, as do older LightOp wheels missing the operator.
+    SGLANG_USE_LIGHTOP_OAI_FP8_QUANT = EnvBool(False)
     # Softmax-probability multiplier before the native E4M3 P x V dot. 448
     # uses the full finite E4M3FN range and is the validated production value.
     SGLANG_M3_TRITON_FP8_P_SCALE = EnvInt(448)
