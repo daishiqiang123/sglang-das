@@ -740,6 +740,26 @@ def _silu_and_mul_post_quant_single_group_kernel(
         )
 
 
+@lru_cache(maxsize=2)
+def _get_lightop_oai_fp8_quant(flat_rows: bool):
+    # Load only after the explicit opt-in and shape/semantics gates. An older
+    # LightOp wheel retains the existing Triton implementation.
+    try:
+        from lightop import op
+    except ImportError:
+        logger.warning("LightOp OAI FP8 quantization unavailable; using Triton")
+        return None
+    name = (
+        "swiglu_oai_fp8_quant_masked_flat"
+        if flat_rows
+        else "swiglu_oai_fp8_quant_masked"
+    )
+    kernel = getattr(op, name, None)
+    if kernel is None:
+        logger.warning("LightOp lacks %s; using Triton OAI FP8 quantization", name)
+    return kernel
+
+
 def silu_and_mul_masked_post_quant_fwd(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -837,6 +857,43 @@ def silu_and_mul_masked_post_quant_fwd(
 
     groups_total = size_n // quant_group_size
     if groups_total == 1 and quant_group_size & (quant_group_size - 1):
+        # The non-power-of-two single-group path already keeps OAI math in
+        # FP32. Keep this opt-in replacement scoped to that exact contract;
+        # packed UE8M0, standard SiLU, other dtypes and layouts retain Triton.
+        if (
+            _is_hcu
+            and envs.SGLANG_USE_LIGHTOP_OAI_FP8_QUANT.get()
+            and input.dtype == torch.bfloat16
+            and 0 < size_n <= 4096
+            and size_n % 8 == 0
+            and input.data_ptr() % 16 == 0
+            and output.data_ptr() % 8 == 0
+            and not scale_ue8m0
+            and gemm1_alpha > 0
+            and gemm1_clamp_limit > 0
+            and swiglu_limit is None
+            and output_scale.dtype == torch.float32
+            and output_scale.is_contiguous()
+            and masked_m.dtype == torch.int32
+            and masked_m.is_contiguous()
+        ):
+            # Sixteen local experts use a device-count prefix scan to
+            # balance live rows across blocks; other EP layouts keep the
+            # general per-expert schedule. Counts remain graph inputs.
+            flat_rows = input.shape[0] == 16
+            kernel = _get_lightop_oai_fp8_quant(flat_rows)
+            if kernel is not None:
+                kernel(
+                    input,
+                    output,
+                    output_scale,
+                    masked_m,
+                    float(gemm1_alpha),
+                    float(gemm1_clamp_limit),
+                    256 if flat_rows else 32,
+                    256,
+                )
+                return
         # Channel-wise FP8 weights use one activation scale per token.  MiniMax
         # has intermediate_size=3072, but tl.arange/reshape require a power-of-2
         # compile-time width.  Run a masked 4096-lane reduction without padding

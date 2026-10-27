@@ -2140,6 +2140,10 @@ class Envs:
     # Validated gfx938 native E4M3FN MFMA path for MiniMax sparse main
     # attention. Index Q/K remain BF16 so Top-K selection is unchanged.
     SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM = EnvBool(False)
+    # HCU OAI SwiGLU with FP32 intermediates and per-row E4M3FN
+    # activation quantization. Standard SiLU and unsupported layouts keep
+    # the existing Triton path, as do older LightOp wheels missing the operator.
+    SGLANG_USE_LIGHTOP_OAI_FP8_QUANT = EnvBool(False)
     # Softmax-probability multiplier before the native E4M3 P x V dot. 448
     # uses the full finite E4M3FN range and is the validated production value.
     SGLANG_M3_TRITON_FP8_P_SCALE = EnvInt(448)
