@@ -23,9 +23,10 @@ from sglang.kernels.ops.attention.decode_attention import (
     _kv_layout_hcu_fa,
 )
 from sglang.kernels.ops.attention.verify_splitkv import _AMD_LAUNCH_KWARGS
-from sglang.srt.utils import is_hcu
+from sglang.srt.utils import is_gfx938_supported, is_hcu
 
 _is_hcu = is_hcu()
+_is_hcu_gfx938 = _is_hcu and is_gfx938_supported()
 
 # Opt-in page64 split-KV vector loads; geometry-specific tuning stays separate.
 # Read once at import; set on every worker before starting the service.
@@ -126,6 +127,7 @@ def _verify_mla_prefix_stage1(
     PAGE_SIZE: tl.constexpr,
     PAGED_V2: tl.constexpr = False,
     PRESERVE_Q_PRECISION: tl.constexpr = False,
+    SLIDING_WINDOW_SIZE: tl.constexpr = -1,
 ):
     cur_batch = tl.program_id(0)
     head_block = tl.program_id(1)
@@ -241,7 +243,18 @@ def _verify_mla_prefix_stage1(
                 )
                 qk += tl.dot(q_pe, k_pe.to(COMPUTE_DTYPE))
             qk *= sm_scale * k_scale
-            qk = tl.where(n_mask[None, :], qk, float("-inf"))
+            score_mask = n_mask[None, :]
+            if SLIDING_WINDOW_SIZE > 0:
+                # kv_indptr describes the clipped prefix, exactly as in extend.
+                # Query i sees prefix key n iff prefix_len + i <= n + window.
+                row_l = tl.reshape(
+                    tl.broadcast_to(offs_l[None, :], (BLOCK_H, L_EXT)), (R,)
+                )
+                score_mask = score_mask & (
+                    cur_batch_seq_len + row_l[:, None]
+                    <= offs_n[None, :] + SLIDING_WINDOW_SIZE
+                )
+            qk = tl.where(score_mask, qk, float("-inf"))
 
             # MLA exposes its latent V through V_Buffer; ordinary shared-KV
             # attention has an independent V cache. Both use this same load.
@@ -286,8 +299,14 @@ def _verify_mla_prefix_stage1(
                     other=0.0,
                 )
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
+            if SLIDING_WINDOW_SIZE > 0:
+                # An entire prefix split can be invisible to a later query.
+                safe_max = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+                re_scale = tl.exp(e_max - safe_max)
+                p = tl.exp(qk - safe_max[:, None])
+            else:
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
             if PRESERVE_Q_PRECISION:
                 v = v.to(COMPUTE_DTYPE)
@@ -358,6 +377,7 @@ def _verify_mla_combine_stage2(
     KV_GROUP_NUM: tl.constexpr,
     HAS_KV_HEADS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    SLIDING_WINDOW_SIZE: tl.constexpr = -1,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -405,8 +425,13 @@ def _verify_mla_combine_stage2(
             other=0.0,
         ).to(tl.float32)
         new_m = tl.maximum(m, lse_s)
-        alpha = tl.exp(m - new_m)
-        beta = tl.exp(lse_s - new_m)
+        if SLIDING_WINDOW_SIZE > 0:
+            safe_m = tl.where(new_m == float("-inf"), 0.0, new_m)
+            alpha = tl.exp(m - safe_m)
+            beta = tl.exp(lse_s - safe_m)
+        else:
+            alpha = tl.exp(m - new_m)
+            beta = tl.exp(lse_s - new_m)
         acc = acc * alpha[:, None] + o_s * beta[:, None]
         l_acc = l_acc * alpha + beta
         m = new_m
@@ -451,6 +476,8 @@ def _verify_mla_combine_stage2(
         vis = (offs_l[None, :] <= offs_l[:, None]) & both_valid
     else:
         vis = both_valid
+    if SLIDING_WINDOW_SIZE > 0:
+        vis = vis & (offs_l[:, None] <= offs_l[None, :] + SLIDING_WINDOW_SIZE)
     qk = tl.where(vis, qk, float("-inf"))
     m_d = tl.max(qk, 1)
     pd = tl.exp(qk - m_d[:, None])
@@ -559,6 +586,7 @@ class VerifyMLA:
         k_scale,
         v_scale,
         page_size=1,
+        sliding_window_size=-1,
     ):
         grid = (bs, self.n_head_blocks, num_splits)
         # Same physical-layout contract as the existing extend reference.
@@ -582,6 +610,26 @@ class VerifyMLA:
             and vh % 64 == 0
         )
         launch_kwargs = _AMD_LAUNCH_KWARGS
+        if (
+            _is_hcu_gfx938
+            and 1 <= bs <= 8
+            and sliding_window_size == 4096
+            and self.h_q == 64
+            and self.kv_group_num == 16
+            and self.head_dim == self.v_head_dim == 128
+            and self.l_ext == 7
+            and self.block_h == 16
+            and self.block_n == 64
+            and self.num_warps == 4
+            and page_size == 64
+            and not _kv_layout_hcu_fa
+            and k_buffer.dim() == v_buffer.dim() == 4
+            and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+            and q_extend.dtype == torch.bfloat16
+        ):
+            # M3.1 draft SWA: waves=4 spills 37 registers on gfx938.
+            # Measured waves=3 removes spills without changing the arithmetic.
+            launch_kwargs = dict(_AMD_LAUNCH_KWARGS, waves_per_eu=3, kpack=1)
         if (
             _is_hcu
             and self.head_dim == self.v_head_dim == 64
@@ -651,6 +699,7 @@ class VerifyMLA:
             BLOCK_N=self.block_n,
             PAGE_SIZE=page_size,
             PAGED_V2=paged_v2,
+            SLIDING_WINDOW_SIZE=sliding_window_size,
             PRESERVE_Q_PRECISION=(
                 _is_hcu
                 and q_extend.dtype in (torch.bfloat16, torch.float16)
@@ -674,6 +723,7 @@ class VerifyMLA:
         kv_indptr,
         sm_scale,
         is_causal=True,
+        sliding_window_size=-1,
     ):
         grid = (bs, self.h_q)
         _verify_mla_combine_stage2[grid](
@@ -711,6 +761,7 @@ class VerifyMLA:
             KV_GROUP_NUM=self.kv_group_num,
             HAS_KV_HEADS=self.has_kv_heads,
             IS_CAUSAL=is_causal,
+            SLIDING_WINDOW_SIZE=sliding_window_size,
             num_warps=4,
             num_stages=1,
         )
@@ -731,6 +782,7 @@ class VerifyMLA:
         v_scale=1.0,
         is_causal=True,
         page_size=1,
+        sliding_window_size=-1,
     ):
         if o_out is None:
             o_out = torch.empty(
@@ -754,6 +806,7 @@ class VerifyMLA:
             k_scale,
             v_scale,
             page_size=page_size,
+            sliding_window_size=sliding_window_size,
         )
         self._run_combine_kernel(
             bs,
@@ -766,6 +819,7 @@ class VerifyMLA:
             kv_indptr,
             sm_scale,
             is_causal=is_causal,
+            sliding_window_size=sliding_window_size,
         )
         return o_out
 
@@ -831,7 +885,8 @@ def can_handle(
 
     IMPORTANT: ``custom_mask`` is intentionally NOT inspected (its values can't
     be read inside a captured HIP graph without a host sync). Every draft query
-    sees the whole committed prefix and, when ``is_causal``, only its own
+    sees the committed prefix within its optional sliding window and, when
+    ``is_causal``, only its own
     predecessors among the draft tokens -- that is the tree mask ONLY at
     speculative topk == 1. The caller therefore MUST gate enablement on topk == 1
     (TritonAttnBackend does: ``use_verify_shared_kv = ... and self.topk == 1``).
@@ -839,7 +894,7 @@ def can_handle(
     # No exotic features.
     if sinks is not None:
         return False
-    if sliding_window_size is not None and sliding_window_size > 0:
+    if sliding_window_size is not None and sliding_window_size > 0 and not is_causal:
         return False
     if logit_cap and logit_cap > 0:
         return False
@@ -949,13 +1004,24 @@ def verify_shared_kv_fwd(
     xai_temperature_len=-1,
     max_bs=None,
     page_size=1,
+    allow_sliding_window=False,
 ):
     """
     Grouped-head drop-in for extend_attention_fwd on a topk==1 target-verify
     shape. Returns True if it ran (o_extend written), False if unsupported
     (caller falls back). A single TP-local KV head needs no offset at all;
-    several are served when the group size is a power of two.
+    several are served when the group size is a power of two. Causal sliding
+    windows require explicit ``allow_sliding_window``; other callers keep their
+    existing fallback. Prefix metadata must follow extend_attention's contract.
     """
+    # Existing callers retain their previous SWA fallback unless explicitly opted in.
+    if (
+        sliding_window_size is not None
+        and sliding_window_size > 0
+        and not allow_sliding_window
+    ):
+        return False
+    sliding_window_size = -1 if sliding_window_size is None else sliding_window_size
     if not can_handle(
         q_extend,
         k_extend,
@@ -1020,5 +1086,6 @@ def verify_shared_kv_fwd(
         v_scale=v_scale,
         is_causal=is_causal,
         page_size=page_size,
+        sliding_window_size=sliding_window_size,
     )
     return True

@@ -95,5 +95,60 @@ def test_v2_launch_is_not_restricted_to_tuned_batch_sizes(enabled, fp8, expected
         assert kernel.__getitem__.return_value.call_args.kwargs["PAGED_V2"] is expected
 
 
+def test_sliding_window_remains_opt_in_without_launching():
+    q, k, v, kb, vb, qo, kvp, kvi = _inputs()
+    out = torch.full_like(q, 123)
+    with patch.object(
+        verify_mla, "_get_vmla", side_effect=AssertionError("must preserve fallback")
+    ):
+        assert not verify_mla.verify_shared_kv_fwd(
+            q,
+            k,
+            v,
+            out,
+            kb,
+            vb,
+            qo,
+            kvp,
+            kvi,
+            None,
+            True,
+            None,
+            6,
+            1.0,
+            1.0,
+            sliding_window_size=4096,
+        )
+    assert torch.all(out == 123)
+
+
+def test_opted_in_noncausal_sliding_window_still_falls_back():
+    q, k, v, kb, vb, qo, kvp, kvi = _inputs()
+    out = torch.full_like(q, 123)
+    with patch.object(
+        verify_mla, "_get_vmla", side_effect=AssertionError("must preserve fallback")
+    ):
+        assert not verify_mla.verify_shared_kv_fwd(
+            q,
+            k,
+            v,
+            out,
+            kb,
+            vb,
+            qo,
+            kvp,
+            kvi,
+            None,
+            False,
+            None,
+            6,
+            1.0,
+            1.0,
+            sliding_window_size=4096,
+            allow_sliding_window=True,
+        )
+    assert torch.all(out == 123)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

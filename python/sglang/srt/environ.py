@@ -1608,6 +1608,8 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Opt-in M3.1 DSpark draft GQA sliding-window grouped split-KV.
+    SGLANG_MINIMAX_M31_DRAFT_SPLITKV = EnvBool(False)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
     # ===================================================================
