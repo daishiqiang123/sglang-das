@@ -609,6 +609,28 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
             device=device,
         )
 
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        # Retain CPU metadata in per-pass dumps for phase-aware offline EPLB.
+        # Graph replay still writes dispatch counts into the existing GPU buffer.
+        global_tokens = forward_batch.original_global_num_tokens_cpu
+        if global_tokens is None:
+            global_tokens = forward_batch.global_num_tokens_cpu
+        self._forward_metadata = dict(
+            forward_mode=forward_batch.forward_mode.name,
+            batch_size=int(forward_batch.batch_size),
+            num_tokens=(
+                int(forward_batch.input_ids.numel())
+                if forward_batch.input_ids is not None
+                else 0
+            ),
+            is_extend_in_batch=bool(forward_batch.is_extend_in_batch),
+            global_num_tokens_cpu=(
+                [int(value) for value in global_tokens]
+                if global_tokens is not None
+                else None
+            ),
+        )
+
     def reset(self):
         self._data[...] = 0
 
@@ -624,7 +646,10 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 num_physical_experts=self._expert_location_metadata.num_physical_experts,
             )
 
-        return dict(global_physical_count=global_physical_count)
+        return dict(
+            global_physical_count=global_physical_count,
+            forward_metadata=getattr(self, "_forward_metadata", {}),
+        )
 
 
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):

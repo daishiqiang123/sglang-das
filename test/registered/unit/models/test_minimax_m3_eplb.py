@@ -4,7 +4,6 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 import torch.nn as nn
-
 from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.models import minimax_m3
@@ -88,6 +87,94 @@ def test_standard_ep_router_applies_expert_location_dispatch():
     )
     moe.experts.assert_called_once_with(hidden_states, topk_output)
     assert output is expected_output
+
+
+@pytest.mark.parametrize("fused_shared", [0, 1])
+@pytest.mark.parametrize("packed", [False, True])
+def test_eplb_exports_live_routed_weights_and_packed_buffers(fused_shared, packed):
+    class Experts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_local_experts = 4
+            self.w13_weight = nn.Parameter(torch.arange(8.0).reshape(4, 2))
+            self.w2_weight = nn.Parameter(torch.ones(4, 2))
+            self.w13_weight_scale = nn.Parameter(torch.ones(4, 1))
+            self.correction_bias = nn.Parameter(torch.ones(4))
+            self.scalar_metadata = nn.Parameter(torch.tensor(1.0))
+            self.other_metadata = nn.Parameter(torch.ones(2))
+            self.global_weight = nn.Parameter(torch.ones(4, 2))
+            self.global_weight._sglang_require_global_experts = True
+            self.register_buffer("unrelated_buffer", torch.ones(4, 2))
+            if packed:
+                self.register_buffer("w13_weight_deepgemm", torch.ones(4, 3))
+                self.register_buffer("w2_weight_deepgemm_masked", torch.ones(4, 5))
+
+    moe = MiniMaxM3MoE.__new__(MiniMaxM3MoE)
+    nn.Module.__init__(moe)
+    moe.experts = Experts()
+    moe.num_fused_shared_experts = fused_shared
+    expected = [
+        moe.experts.w13_weight,
+        moe.experts.w2_weight,
+        moe.experts.w13_weight_scale,
+    ]
+    if packed:
+        expected += [
+            moe.experts.w13_weight_deepgemm,
+            moe.experts.w2_weight_deepgemm_masked,
+        ]
+    exported = moe.get_moe_weights()
+    assert len(exported) == len(expected)
+    for view, weight in zip(exported, expected):
+        assert view.shape == weight[: 4 - fused_shared].shape
+        assert view.data_ptr() == weight.data_ptr()
+        assert view.stride() == weight.stride()
+        before_shared = weight[-1].clone()
+        view.add_(10)
+        if fused_shared:
+            assert torch.equal(weight[-1], before_shared)
+
+    # Migration must resolve replacements made after quantization, not retain
+    # stale Parameter references from model construction.
+    previous = moe.experts.w13_weight
+    moe.experts.w13_weight = nn.Parameter(torch.full((4, 2), 99.0))
+    refreshed = moe.get_moe_weights()[0]
+    assert refreshed.data_ptr() == moe.experts.w13_weight.data_ptr()
+    assert refreshed.data_ptr() != previous.data_ptr()
+
+
+def test_eplb_model_and_causal_lm_export_only_local_routed_layers():
+    from sglang.srt.models.minimax_m3 import MiniMaxM3Model, MiniMaxM3SparseForCausalLM
+
+    def routed_layer():
+        moe = MiniMaxM3MoE.__new__(MiniMaxM3MoE)
+        nn.Module.__init__(moe)
+        moe.experts = nn.Module()
+        moe.experts.num_local_experts = 2
+        moe.experts.w13_weight = nn.Parameter(torch.ones(2, 3))
+        moe.num_fused_shared_experts = 0
+        layer = nn.Module()
+        layer.mlp = moe
+        return layer
+
+    model = MiniMaxM3Model.__new__(MiniMaxM3Model)
+    nn.Module.__init__(model)
+    dense = nn.Module()
+    dense.mlp = nn.Linear(3, 3)
+    model.layers = nn.ModuleList(
+        [routed_layer(), routed_layer(), dense, routed_layer()]
+    )
+    model.start_layer, model.end_layer = 1, 4
+    wrapper = MiniMaxM3SparseForCausalLM.__new__(MiniMaxM3SparseForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.model = model
+    exported = wrapper.routed_experts_weights_of_layer
+    assert set(exported) == {1, 3}
+    for layer_id in [1, 3]:
+        assert (
+            exported[layer_id][0].data_ptr()
+            == model.layers[layer_id].mlp.experts.w13_weight.data_ptr()
+        )
 
 
 if __name__ == "__main__":

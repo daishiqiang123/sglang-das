@@ -71,6 +71,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
+    filter_moe_weight_param_global_expert,
     hcu_moe_tp_matches_attention_tp,
     get_moe_a2a_backend,
     has_per_rank_fused_shared_slots,
@@ -474,6 +475,31 @@ class MiniMaxM3MLP(nn.Module):
 
 class MiniMaxM3MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
+
+    def get_moe_weights(self):
+        """Return live routed-expert weights and scales for EPLB migration."""
+        # Resolve after quantization: packing can replace Parameters with buffers.
+        weights = list(self.experts.named_parameters())
+        packed_names = {
+            "w13_weight_deepgemm",
+            "w2_weight_deepgemm",
+            "w13_weight_deepgemm_masked",
+            "w2_weight_deepgemm_masked",
+        }
+        weights.extend(
+            (name, tensor)
+            for name, tensor in self.experts.named_buffers()
+            if name in packed_names
+        )
+        num_routed = self.experts.num_local_experts - self.num_fused_shared_experts
+        return [
+            tensor.data[:num_routed]
+            for name, tensor in weights
+            if name != "correction_bias"
+            and filter_moe_weight_param_global_expert(
+                name, tensor, self.experts.num_local_experts
+            )
+        ]
 
     def __init__(
         self,
@@ -1989,6 +2015,14 @@ class MiniMaxM3Model(nn.Module):
 
     fall_back_to_pt_during_load = False
 
+    @property
+    def routed_experts_weights_of_layer(self):
+        return {
+            layer_id: self.layers[layer_id].mlp.get_moe_weights()
+            for layer_id in range(self.start_layer, self.end_layer)
+            if isinstance(self.layers[layer_id].mlp, MiniMaxM3MoE)
+        }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2131,6 +2165,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         "index_qkv_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.model.routed_experts_weights_of_layer
 
     def __init__(
         self,

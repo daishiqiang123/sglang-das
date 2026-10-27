@@ -169,6 +169,10 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.model.routed_experts_weights_of_layer
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         # EP asserts if this hook is absent on the top-level arch; VL nests the
