@@ -87,78 +87,6 @@ def _should_use_aiter_runner() -> bool:
     )
 
 
-def _minimax_tp_runner_owns_pack(layer) -> bool:
-    # Keep the pre-existing scheme path for all callers outside this opt-in.
-    if not _should_use_aiter_runner():
-        return False
-    from sglang.srt.layers.moe.moe_runner.aiter import use_minimax_tp_inplace_weights
-
-    return use_minimax_tp_inplace_weights(
-        layer.moe_runner_config, layer.w13_weight.dtype
-    )
-
-
-def _hcu_aiter_fp8_noshuffle_supported(layer) -> bool:
-    """Return True when the HCU aiter ASM table covers this FP8 MoE shape
-    with ``use_shuffle=0``.
-
-    The HCU ``aiter_moe`` ASM kernels expect the checkpoint (no-shuffle)
-    weight layout — same contract as the channel-INT8 MoE path.  Shuffling
-    w13/w2 with ``shuffle_weight`` (while the per-row ``w13_weight_scale``
-    stays unshuffled) misaligns every weight row with its scale and corrupts
-    the routed expert output.
-    """
-    if not _is_hcu:
-        return False
-    w13 = getattr(layer, "w13_weight", None)
-    w2 = getattr(layer, "w2_weight", None)
-    if w13 is None or w2 is None or w13.ndim != 3 or w2.ndim != 3:
-        return False
-    E, N1, K = (int(dim) for dim in w13.shape)
-    E2, N2, n = (int(dim) for dim in w2.shape)
-    if E != E2 or N2 != K or N1 != 2 * n:
-        return False
-    top_k = getattr(layer, "top_k", None)
-    if top_k is None:
-        cfg = getattr(layer, "moe_runner_config", None)
-        top_k = getattr(cfg, "top_k", None) if cfg is not None else None
-    if not top_k:
-        return False
-    try:
-        from aiter.moe import MoeQuantType, MoeSolutionType, get_aiter_moe_config
-
-        kwargs = dict(
-            M=1,
-            E=E,
-            N1=N1,
-            N2=N2,
-            K=K,
-            top_k=int(top_k),
-            block_size=0,
-            dtype=torch.bfloat16,
-            quant_type=MoeQuantType.FP8_W8A8,
-            activation="silu",
-            spec_sol_type=MoeSolutionType.ASM,
-            use_shuffle=0,
-        )
-        # An API unable to express the layout constraint cannot prove support.
-        # Fail closed instead of probing a potentially shuffled kernel.
-        status, _ = get_aiter_moe_config(**kwargs)
-        return bool(status)
-    except Exception as exc:  # noqa: BLE001
-        logger.info(
-            "HCU AITER FP8 no-shuffle probe failed for E=%s N1=%s N2=%s K=%s "
-            "topk=%s (%s); using legacy shuffle path",
-            E,
-            N1,
-            N2,
-            K,
-            top_k,
-            exc,
-        )
-        return False
-
-
 def is_moe_prefill_or_normal():
     return (
         get_disagg().disaggregation_mode == "prefill"
@@ -172,6 +100,7 @@ def _should_use_hcu_fp8_w8a8_moe(
     in_speculative_a2a_scope: bool,
     speculative_algorithm: Optional[str],
     use_deepep: bool,
+    explicit_aiter_backend: bool = False,
 ) -> bool:
     """Keep the HCU LightOp path for non-DSpark speculative workers.
 
@@ -184,7 +113,9 @@ def _should_use_hcu_fp8_w8a8_moe(
         and (speculative_algorithm or "").upper() == "DSPARK"
         and not use_deepep
     )
-    return enabled and not is_standalone_dspark_draft
+    # An explicit AITER runner owns packing even when the legacy flag is
+    # needed to select FP8 DeepEP activation quantization.
+    return enabled and not explicit_aiter_backend and not is_standalone_dspark_draft
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
@@ -218,6 +149,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             in_speculative_a2a_scope=get_flags().moe.in_speculative_a2a_scope,
             speculative_algorithm=get_global_server_args().speculative_algorithm,
             use_deepep=self.use_deepep,
+            explicit_aiter_backend=get_moe_runner_backend().is_aiter(),
         )
 
         self.static_input_scales = not self.input_quant.dynamic
@@ -530,41 +462,43 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             return
 
         if (
-            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            _is_hcu
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and _should_use_aiter_runner()
+        ):
+            # The unified AITER runner selects the config and owns both weight
+            # and scale layouts. Keep checkpoint layout until eager warmup;
+            # legacy env switches must not pre-pack it for a different kernel.
+            return
+
+        if (
+            not _is_hcu
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _should_use_aiter_runner()
             and layer.moe_runner_config.gemm1_alpha is None
             and layer.moe_runner_config.gemm1_clamp_limit is None
         ):
-            if _hcu_aiter_fp8_noshuffle_supported(layer):
-                # The HCU aiter ASM kernel expects the checkpoint (no-shuffle)
-                # layout, matching the runner's use_shuffle=0 config lookup.
-                # Shuffling w13/w2 while w13_weight_scale stays unshuffled
-                # misaligns each weight row from its scale and corrupts the
-                # routed expert output.
-                setattr(layer, "_hcu_aiter_fp8_noshuffle", True)
-            else:
-                # Keep this import lazy: explicit AITER MoE should not require the
-                # broad SGLANG_USE_AITER import surface during module import.
-                from aiter.ops.shuffle import shuffle_weight
+            # Preserve the non-HCU fused_moe loading contract.
+            from aiter.ops.shuffle import shuffle_weight
 
-                with torch.no_grad():
-                    # Pre-shuffle weights
-                    layer.w13_weight = torch.nn.Parameter(
-                        shuffle_weight(layer.w13_weight.data, (16, 16)),
-                        requires_grad=False,
-                    )
-                    torch.cuda.empty_cache()
-                    layer.w2_weight = torch.nn.Parameter(
-                        shuffle_weight(layer.w2_weight.data, (16, 16)),
-                        requires_grad=False,
-                    )
-                    torch.cuda.empty_cache()
+            with torch.no_grad():
+                layer.w13_weight = torch.nn.Parameter(
+                    shuffle_weight(layer.w13_weight.data, (16, 16)),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
+                layer.w2_weight = torch.nn.Parameter(
+                    shuffle_weight(layer.w2_weight.data, (16, 16)),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _use_deepgemm_moe
             and _is_hcu
             and self.use_deepep
             and not get_moe_runner_backend().is_deep_gemm()
+            and not get_moe_runner_backend().is_aiter()
         ):
             # SGLANG_USE_DEEPGEMM_MOE is process-wide, but DSpark may use a
             # standalone draft MoE alongside a DeepEP target MoE.  Repacking
@@ -577,10 +511,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             and not self.use_hcu_fp8_w8a8_moe
             and _use_aiter_fp8_w8a8_moe
             and _use_shuffle
-            and not (
-                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and _minimax_tp_runner_owns_pack(layer)
-            )
         ):
             w13_weight = asm_shuffle_weight_b8(layer.w13_weight, 1)
             layer.w13_weight.copy_(w13_weight)
@@ -803,11 +733,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 expert_mask=expert_map,
                 # HCU 0.5.18 fused_moe cannot run bf16×fp8; use aiter_moe.
                 use_fp8_w8a8=_is_hcu,
-                # The scheme probe keeps checkpoint-layout weights when the
-                # ASM table matches; tell the unified runner to pick the
-                # matching no-shuffle ASM config instead of a shuffled one.
-                w8a8_no_shuffle=_is_hcu
-                and getattr(layer, "_hcu_aiter_fp8_noshuffle", False),
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:

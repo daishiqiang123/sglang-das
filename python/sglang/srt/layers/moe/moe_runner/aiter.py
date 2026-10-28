@@ -39,7 +39,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -226,28 +225,20 @@ def _aiter_moe_supports_weight_shuffle(aiter_moe_fn) -> bool:
         return False
 
 
-def use_minimax_tp_inplace_weights(config: MoeRunnerConfig, weight_dtype) -> bool:
-    """Opt in only the channel-FP8 MiniMax TP path to model-owned packing.
-
-    Reuse the existing shuffle flag. Other models, EP/DeepEP, non-HCU, and
-    unshuffled configurations retain their current weight/cache ownership.
-    Set the flag before loading weights and do not change it at runtime.
-    """
-    if not (
-        _is_hcu
-        and config.is_minimax_m3
-        and weight_dtype == torch.float8_e4m3fn
-        and get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE")
-    ):
-        return False
-    parallel = get_parallel()
-    if parallel.moe_ep_size != 1 or parallel.moe_tp_size <= 1:
-        return False
-    # Older AITER APIs must retain the original packing/call contract even
-    # when their existing shuffle switch is set by a deployment profile.
-    from aiter.moe import aiter_moe
-
-    return _aiter_moe_supports_weight_shuffle(aiter_moe)
+def get_aiter_moe_weight_shuffle_kwargs(
+    moe_config: Any, aiter_moe_fn: Any
+) -> dict[str, bool]:
+    """Keep the native kernel's layout flag consistent with prepared weights."""
+    if _aiter_moe_supports_weight_shuffle(aiter_moe_fn):
+        return {"use_weight_shuffle": bool(moe_config.need_shuffle)}
+    # Older MoE-C APIs encode their packed layout in the selected backend.
+    # ASM/CK need the explicit flag; reject them before modifying weights.
+    if moe_config.need_shuffle and moe_config.solution_type in ("asm", "ck"):
+        raise RuntimeError(
+            "Shuffled AITER ASM/CK weights require use_weight_shuffle support. "
+            "Please upgrade AITER or select a compatible weight layout."
+        )
+    return {}
 
 
 class AiterQuantType(str, Enum):
@@ -922,11 +913,9 @@ class AiterRunnerCore(MoeRunnerCore):
 
         apply_aiter_small_moe_sort_patch()
         self._unified_config_cache = _AITER_UNIFIED_MOE_CONFIG_CACHE
-        self._unified_weight_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._unified_scale_cache: dict[tuple, torch.Tensor] = {}
-        # Legacy layers retain layout metadata, never a second weight tensor.
-        self._legacy_weight_layout: Optional[_AiterWeightLayout] = None
-        self._legacy_raw_graph_captured = False
+        # All unified callers use model-owned storage and one layout contract.
+        self._weight_layout: Optional[_AiterWeightLayout] = None
+        self._raw_graph_captured = False
         # Dispatcher expert metadata is immutable for a loaded MoE layer.
         # Cache the unified API's normalized map so DeepEP's bool sink mask
         # does not allocate/rebuild one tensor per layer on every decode step.
@@ -986,6 +975,7 @@ class AiterRunnerCore(MoeRunnerCore):
         from aiter.moe import (
             AiterMoeConfig,
             MoeSolutionType,
+            aiter_moe,
             get_aiter_moe_config,
         )
 
@@ -993,24 +983,24 @@ class AiterRunnerCore(MoeRunnerCore):
 
         w1 = quant_info.w13_weight
         w2 = quant_info.w2_weight
-        # TP MoE keeps a single model-owned packed copy; retain its layout guard.
-        layout = (
-            None
-            if self.config.is_minimax_m3
-            and not self._use_inplace_minimax_tp_weights(quant_info)
-            else self._legacy_weight_layout
-        )
+        layout = self._weight_layout
         w1_shape, w2_shape = (
             layout.logical_shapes if layout is not None else (w1.shape, w2.shape)
         )
         top_k = runner_input.topk_ids.shape[-1]
         force_moe_c = envs.SGLANG_FORCE_AITER_MOE_C.get()
-        # Select a weight layout, while AITER keeps its normal backend priority.
+        # The existing switch selects ASM's table, never pre-packs weights.
+        # The returned config is the authority for the actual weight layout.
         use_shuffle = (
-            self._use_inplace_minimax_tp_weights(quant_info)
+            _is_hcu
             and quant_type == "fp8_w8a8"
             and block_size == 0
             and get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE")
+            and _aiter_moe_supports_weight_shuffle(aiter_moe)
+        )
+        requires_exact_m = (
+            self.config.gemm1_alpha is not None
+            or self.config.gemm1_clamp_limit is not None
         )
         if use_shuffle and quant_info.w8a8_no_shuffle:
             raise ValueError("Shuffle requested for checkpoint-only AITER weights")
@@ -1030,7 +1020,7 @@ class AiterRunnerCore(MoeRunnerCore):
             force_moe_c,
             use_shuffle,
             quant_info.w8a8_no_shuffle,
-            self.config.is_minimax_m3,
+            requires_exact_m,
             layout.signature if layout is not None else None,
         )
         cached = self._unified_config_cache.get(cache_key)
@@ -1094,7 +1084,7 @@ class AiterRunnerCore(MoeRunnerCore):
             # weights have not passed this layout's service-level gate.
             status = False
         if (
-            self.config.is_minimax_m3
+            requires_exact_m
             and status
             and moe_config.solution_type == MoeSolutionType.MOE_C
         ):
@@ -1162,72 +1152,12 @@ class AiterRunnerCore(MoeRunnerCore):
         self._unified_config_cache[cache_key] = moe_config
         return moe_config
 
-    def _use_inplace_minimax_tp_weights(self, quant_info: AiterMoeQuantInfo) -> bool:
-        enabled = (
-            quant_info.quant_type == AiterQuantType.PER_TOKEN
-            and quant_info.w2_weight.dtype == torch.float8_e4m3fn
-            and use_minimax_tp_inplace_weights(self.config, quant_info.w13_weight.dtype)
-        )
-        if (
-            self.config.is_minimax_m3
-            and self._legacy_weight_layout is not None
-            and not enabled
-        ):
-            raise RuntimeError(
-                "MiniMax TP packing configuration cannot change after weight conversion"
-            )
-        return enabled
-
     def _get_unified_weights(
-        self,
-        quant_info: AiterMoeQuantInfo,
-        moe_config: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.config.is_minimax_m3 or self._use_inplace_minimax_tp_weights(
-            quant_info
-        ):
-            return self._get_legacy_weights(
-                quant_info=quant_info, moe_config=moe_config
-            )
-        w1 = quant_info.w13_weight
-        w2 = quant_info.w2_weight
-        if not moe_config.need_shuffle:
-            return w1, w2
-
-        cache_key = (
-            id(w1),
-            id(w2),
-            moe_config.solution_type,
-            moe_config.quant_type,
-        )
-        cached = self._unified_weight_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        from aiter.moe import aiter_moe_shfl_weight
-
-        with torch.no_grad():
-            if self._uses_moe_c_oai_interleaved_layout(moe_config):
-                # The installed channel-FP8 MoE-C GEMM expects its generic
-                # GEMM2 shuffle for both stages, while the swigluoai epilogue
-                # consumes interleaved [gate0, up0, gate1, up1, ...] rows.
-                # MiniMax stores split [gate..., up...] rows, so reorder W1
-                # once before AITER's normal shuffle. W2 is unchanged.
-                w1 = self._interleave_split_gate_up(w1)
-                shuffled = aiter_moe_shfl_weight(w1, w2, moe_config)
-            else:
-                shuffled = aiter_moe_shfl_weight(w1, w2, moe_config)
-
-        assert shuffled[0] is not None and shuffled[1] is not None
-        weights = (shuffled[0], shuffled[1])
-        self._unified_weight_cache[cache_key] = weights
-        return weights
-
-    def _get_legacy_weights(
         self, quant_info: AiterMoeQuantInfo, moe_config: Any
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare the selected layout once, preserving model-owned storage."""
         w1, w2 = quant_info.w13_weight, quant_info.w2_weight
-        layout = self._legacy_weight_layout
+        layout = self._weight_layout
         padded_k = (getattr(moe_config, "config", None) or {}).get("PADDED_K")
         logical_shapes = (
             layout.logical_shapes
@@ -1238,21 +1168,22 @@ class AiterRunnerCore(MoeRunnerCore):
             moe_config.solution_type,
             moe_config.quant_type,
             int(padded_k or 0) or logical_shapes[0][-1],
+            self._uses_moe_c_oai_interleaved_layout(moe_config),
         )
         if layout is not None:
             if not moe_config.need_shuffle or signature != layout.signature:
                 raise RuntimeError(
-                    "AITER legacy weights are already shuffled; the selected "
+                    "AITER weights are already shuffled; the selected "
                     "config requires an incompatible weight layout."
                 )
             return w1.view(layout.packed_shapes[0]), w2.view(layout.packed_shapes[1])
         capturing = w1.is_cuda and torch.cuda.is_current_stream_capturing()
         if not moe_config.need_shuffle:
-            self._legacy_raw_graph_captured |= capturing
+            self._raw_graph_captured |= capturing
             return w1, w2
-        if capturing or self._legacy_raw_graph_captured:
+        if capturing or self._raw_graph_captured:
             raise RuntimeError(
-                "AITER legacy weight shuffle must finish during eager warmup "
+                "AITER weight shuffle must finish during eager warmup "
                 "before CUDA Graph capture."
             )
 
@@ -1272,7 +1203,7 @@ class AiterRunnerCore(MoeRunnerCore):
                     or packed.shape[0] != original.shape[0]
                 ):
                     raise RuntimeError(
-                        "AITER legacy shuffle changed expert storage size/layout; "
+                        "AITER shuffle changed expert storage size/layout; "
                         "prepare compatible padded weights before warmup."
                     )
                 sources.append(
@@ -1295,7 +1226,7 @@ class AiterRunnerCore(MoeRunnerCore):
             logical_shapes=logical_shapes,
             packed_shapes=(tuple(shuffled[0].shape), tuple(shuffled[1].shape)),
         )
-        self._legacy_weight_layout = layout
+        self._weight_layout = layout
         return w1.view(layout.packed_shapes[0]), w2.view(layout.packed_shapes[1])
 
     @staticmethod
@@ -1303,7 +1234,7 @@ class AiterRunnerCore(MoeRunnerCore):
         """Convert axis-1 [gate..., up...] data to [gate0, up0, ...]."""
         if tensor.ndim < 2 or tensor.shape[1] % 2:
             raise ValueError(
-                "MiniMax MoE-C gate/up tensor must have an even axis-1, got "
+                "AITER MoE-C gate/up tensor must have an even axis-1, got "
                 f"shape={tuple(tensor.shape)}"
             )
         half = tensor.shape[1] // 2
@@ -1330,22 +1261,8 @@ class AiterRunnerCore(MoeRunnerCore):
         quant_info: AiterMoeQuantInfo,
         moe_config: Any,
     ) -> Optional[torch.Tensor]:
-        scale = quant_info.w13_scale
-        if not self.config.is_minimax_m3 or self._use_inplace_minimax_tp_weights(
-            quant_info
-        ):
-            # Legacy scales are prepared in-place together with the weights.
-            return scale
-        if scale is None or not self._uses_moe_c_oai_interleaved_layout(moe_config):
-            return scale
-        cache_key = (id(scale), moe_config.solution_type, moe_config.quant_type)
-        cached = self._unified_scale_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        with torch.no_grad():
-            interleaved = self._interleave_split_gate_up(scale)
-        self._unified_scale_cache[cache_key] = interleaved
-        return interleaved
+        # Scale rows are transformed once together with model-owned weights.
+        return quant_info.w13_scale
 
     def _build_expert_map(
         self,
@@ -1492,6 +1409,7 @@ class AiterRunnerCore(MoeRunnerCore):
         moe_config = self._get_unified_moe_config(
             runner_input, quant_info, quant_type, block_size
         )
+        shuffle_kwargs = get_aiter_moe_weight_shuffle_kwargs(moe_config, aiter_moe)
         w1, w2 = self._get_unified_weights(quant_info, moe_config)
         if runner_input.uses_local_expert_ids:
             global_num_experts, expert_map = -1, None
@@ -1565,11 +1483,7 @@ class AiterRunnerCore(MoeRunnerCore):
             global_num_experts=global_num_experts,
             expert_map=backend_expert_metadata,
             routed_scaling_factor=self.config.routed_scaling_factor,
-            **(
-                {"use_weight_shuffle": moe_config.need_shuffle}
-                if self._use_inplace_minimax_tp_weights(quant_info)
-                else {}
-            ),
+            **shuffle_kwargs,
             output_dtype=runner_input.output_dtype,
             **activation_kwargs,
         )

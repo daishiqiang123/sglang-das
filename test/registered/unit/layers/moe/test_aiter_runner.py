@@ -285,6 +285,7 @@ def test_unified_aiter_moe_c_uses_oai_activation_and_interleaved_scale(
     fake_moe = ModuleType("aiter.moe")
     fake_moe.MoeSolutionType = MoeSolutionType
     fake_moe.aiter_moe = aiter_moe
+    fake_moe.aiter_moe_shfl_weight = lambda w1, w2, cfg: (w1.clone(), w2.clone())
     monkeypatch.setitem(sys.modules, "aiter.moe", fake_moe)
 
     runner = AiterRunnerCore(
@@ -298,7 +299,7 @@ def test_unified_aiter_moe_c_uses_oai_activation_and_interleaved_scale(
         )
     )
     config = SimpleNamespace(
-        need_shuffle=False,
+        need_shuffle=True,
         solution_type="moe_c",
         quant_type="fp8_w8a8",
     )
@@ -370,8 +371,9 @@ def test_unified_aiter_moe_c_interleaves_minimax_gate_up_before_shuffle(
     interleaved_scale = runner._get_unified_w1_scale(quant_info, config)
 
     assert result[0].flatten().tolist() == [1.0, 10.0, 2.0, 20.0]
-    assert result[1] is w2
-    assert captured["w1"] is result[0]
+    assert result[0].data_ptr() == w1.data_ptr()
+    assert result[1].data_ptr() == w2.data_ptr()
+    torch.testing.assert_close(captured["w1"], result[0])
     assert captured["w2"] is w2
     assert interleaved_scale.flatten().tolist() == pytest.approx([0.1, 1.0, 0.2, 2.0])
 
@@ -717,6 +719,52 @@ def test_explicit_aiter_runner_controls_channel_fp8_weight_layout(monkeypatch):
     )
 
     assert channel_fp8_scheme._should_use_aiter_runner()
+
+
+@pytest.mark.parametrize("tp,ep", [(1, 1), (2, 1), (8, 1), (1, 8)])
+@pytest.mark.parametrize("model_marker", [False, True])
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_hcu_channel_fp8_loading_defers_packing_to_runner(
+    monkeypatch, tp, ep, model_marker, shuffle
+):
+    from compressed_tensors.quantization import QuantizationStrategy
+
+    monkeypatch.setattr(channel_fp8_scheme, "_is_hcu", True)
+    monkeypatch.setattr(channel_fp8_scheme, "is_fp8_fnuz", lambda: False)
+    monkeypatch.setattr(channel_fp8_scheme, "_should_use_aiter_runner", lambda: True)
+    monkeypatch.setattr(channel_fp8_scheme, "_use_shuffle", shuffle)
+    monkeypatch.setattr(channel_fp8_scheme, "_use_aiter_fp8_w8a8_moe", True)
+    monkeypatch.setattr(
+        channel_fp8_scheme,
+        "get_moe_a2a_backend",
+        lambda: SimpleNamespace(is_megamoe=lambda: False),
+    )
+    monkeypatch.setattr(
+        channel_fp8_scheme,
+        "asm_shuffle_weight_b8",
+        lambda *args: pytest.fail("scheme must not pre-pack runner-owned weights"),
+        raising=False,
+    )
+    scheme = object.__new__(CompressedTensorsW8A8Fp8MoE)
+    scheme.weight_quant = SimpleNamespace(strategy=QuantizationStrategy.CHANNEL)
+    scheme.static_input_scales = False
+    layer = torch.nn.Module()
+    layer.moe_tp_size, layer.moe_ep_size = tp, ep
+    layer.moe_runner_config = MoeRunnerConfig(is_minimax_m3=model_marker)
+    layer.w13_weight = torch.nn.Parameter(
+        torch.arange(64).reshape(2, 8, 4).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.arange(32).reshape(2, 4, 4).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(torch.ones(2, 8, 1))
+    layer.w2_weight_scale = torch.nn.Parameter(torch.ones(2, 4, 1))
+    before = {name: (p, p.float().clone()) for name, p in layer.named_parameters()}
+    scheme.process_weights_after_loading(layer)
+    for name, (original, values) in before.items():
+        assert getattr(layer, name) is original
+        torch.testing.assert_close(original.float(), values)
+    assert not hasattr(layer, "_hcu_aiter_fp8_noshuffle")
 
 
 def test_explicit_non_aiter_runner_overrides_legacy_switch(monkeypatch):
