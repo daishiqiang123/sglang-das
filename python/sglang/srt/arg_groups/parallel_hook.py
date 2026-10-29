@@ -92,6 +92,22 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     return {}
 
 
+def _hcu_query_sharded_prefill_cp_enabled(cfg) -> bool:
+    """Allow the explicit single-node HCU query-sharded CP-v2 topology."""
+    return (
+        is_hcu()
+        and envs.SGLANG_ENABLE_CP_V2.get()
+        and os.environ.get("SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP", "0")
+        in ("1", "true", "True")
+        and cfg.cp_strategy == "zigzag"
+        and cfg.pp_size == 1
+        and cfg.nnodes == 1
+        and cfg.attn_dp_size == 1
+        and cfg.attn_cp_size > 1
+        and cfg.attn_cp_size == cfg.tp_size
+    )
+
+
 def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
@@ -116,10 +132,12 @@ def handle_context_parallelism(server_args: Any):
             cfg.enable_prefill_cp
             and get_platform().is_hip
             and model_arch != "DeepseekV4ForCausalLM"
+            and not _hcu_query_sharded_prefill_cp_enabled(cfg)
         ):
             raise ValueError(
-                "Prefill CP on HIP is only supported for "
-                f"DeepseekV4ForCausalLM, got {model_arch!r}."
+                "Prefill CP on HIP is only supported for DeepseekV4ForCausalLM "
+                "or the opt-in single-node HCU query-sharded CP-v2 "
+                f"path (zigzag, attention TP1), got {model_arch!r}."
             )
         if (
             cfg.enable_prefill_cp

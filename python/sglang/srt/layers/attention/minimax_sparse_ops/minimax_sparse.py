@@ -83,7 +83,9 @@ def _flash_mla_prefill_index_view(page_table, safe_pages, max_seqlen_k, block_si
     if max_seqlen_k <= 0:
         return page_table, safe_pages
     full_pages = page_table.shape[1]
-    live_pages = min(full_pages, max(128, (max_seqlen_k + block_size - 1) // block_size))
+    live_pages = min(
+        full_pages, max(128, (max_seqlen_k + block_size - 1) // block_size)
+    )
     if live_pages == full_pages:
         return page_table, safe_pages
     bounded_table = page_table[:, :live_pages]
@@ -133,6 +135,7 @@ def minimax_sparse_prefill(
     flash_mla_indices_output: Optional[torch.Tensor] = None,
     flash_mla_prefill_k_end: Optional[torch.Tensor] = None,
     flash_mla_safe_pages: Optional[torch.Tensor] = None,
+    flash_mla_prefill_index_view: Optional[tuple] = None,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
@@ -192,7 +195,17 @@ def minimax_sparse_prefill(
     max_block_size_q = max(1, main_max_qh // gqa_group_size)
     while block_size_q > max_block_size_q:
         block_size_q //= 2
-    if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
+    # FlashMLA indexer/main consume cu_seqlens directly; Triton seqblock
+    # metadata is dead work on this full FlashMLA path. Keep the old path
+    # available for the controlled A/B and every fallback backend.
+    skip_unused_seqblocks = (
+        os.environ.get("SGLANG_MINIMAX_SKIP_UNUSED_PREFILL_SEQBLOCKS", "0") == "1"
+        and use_flash_mla_gfx938
+        and use_flash_mla_gfx938_indexer
+    )
+    if not skip_unused_seqblocks and (
+        cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None
+    ):
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
@@ -275,8 +288,13 @@ def minimax_sparse_prefill(
         from .flash_mla_gfx938 import flash_mla_sparse_prefill_indexer
 
         idx_o = None
-        index_page_table, index_safe_pages = _flash_mla_prefill_index_view(
-            flash_mla_page_table, flash_mla_safe_pages, max_seqlen_k, block_size_k
+        # Forward-local cached view avoids the same cropped-page copy per layer.
+        index_page_table, index_safe_pages = (
+            flash_mla_prefill_index_view
+            if flash_mla_prefill_index_view is not None
+            else _flash_mla_prefill_index_view(
+                flash_mla_page_table, flash_mla_safe_pages, max_seqlen_k, block_size_k
+            )
         )
         topk_idx = flash_mla_sparse_prefill_indexer(
             idx_q,
@@ -393,7 +411,11 @@ def minimax_sparse_prefill(
         else:
             topk_idx = grouped_union
         main_block_size_q = exact_grouped_main_q
-    elif block_size_q > 1 and topk_idx.shape[1] == q.shape[0]:
+    elif (
+        not skip_unused_seqblocks
+        and block_size_q > 1
+        and topk_idx.shape[1] == q.shape[0]
+    ):
         # A per-query Top-K producer must use the established Q1 consumer.
         main_block_size_q = 1
         (

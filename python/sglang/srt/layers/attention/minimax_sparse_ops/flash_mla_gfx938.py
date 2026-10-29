@@ -8,6 +8,7 @@ remain in SGLang because they encode serving metadata and MiniMax semantics.
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -326,16 +327,22 @@ def build_flash_mla_sparse_prefill_k_end(
             f"dimensions: q_lens={lens.numel()}, prefix_lens={prefix_lens.numel()}, "
             f"queries={num_queries}"
         )
+    # Keep the baseline selected until the opt-in pipeline passes E2E validation.
+    repeat_kwargs = (
+        {"output_size": int(num_queries)}
+        if os.environ.get("SGLANG_MINIMAX_CACHE_PREFILL_INDEX_METADATA", "0") == "1"
+        else {}
+    )
     batch_ids = torch.arange(
         lens.numel(), device=device, dtype=torch.long
-    ).repeat_interleave(lens)
+    ).repeat_interleave(lens, **repeat_kwargs)
     if batch_ids.numel() != int(num_queries):
         raise FlashMLAGfx938UnavailableError(
             "FlashMLA MSA128 cached prefill metadata has inconsistent query rows: "
             f"q_lens rows={batch_ids.numel()}, queries={num_queries}"
         )
     within = torch.arange(int(num_queries), device=device) - cu[:-1].repeat_interleave(
-        lens
+        lens, **repeat_kwargs
     )
     return (prefix_lens.to(torch.long)[batch_ids] + within + 1).to(torch.int32)
 
@@ -586,9 +593,7 @@ def flash_mla_sparse_decode_main(
     # derives prefix+i from final_length-verify_width+i. Passing [B,S] here
     # makes the native kernel read the first B flattened values instead.
     grouped_seq_lens = (
-        seq_lens.reshape(batch, verify_group_size)[:, -1]
-        .to(torch.int32)
-        .contiguous()
+        seq_lens.reshape(batch, verify_group_size)[:, -1].to(torch.int32).contiguous()
     )
     indices = expand(
         blocks,

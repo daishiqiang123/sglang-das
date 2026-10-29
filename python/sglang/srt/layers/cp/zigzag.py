@@ -382,6 +382,16 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         """
         return self._all_gather_reorganized(x, forward_batch, reuse_output=True)
 
+    def gather_kv_cache_raw_reusable(self, x, forward_batch):
+        """Return rank-major payload and logical-row map for a fused consumer.
+
+        Consume both on the current stream before the next reusable gather.
+        The normal gather API continues returning a reordered tensor.
+        """
+        return self._all_gather_reorganized(
+            x, forward_batch, reuse_output=True, return_reorder_map=True
+        )
+
     def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
         meta = forward_batch.attn_cp_metadata
         device = getattr(getattr(forward_batch, "input_ids", None), "device", None)
@@ -511,13 +521,17 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         forward_batch,
         *,
         reuse_output: bool,
+        return_reorder_map: bool = False,
     ):
         meta = forward_batch.attn_cp_metadata
         per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
         per_rank_token = [int(v) for v in per_rank_token]
         max_len = max(per_rank_token, default=0)
         if max_len == 0:
-            return x.new_empty((0, *x.shape[1:]))
+            empty = x.new_empty((0, *x.shape[1:]))
+            if return_reorder_map:
+                return empty, torch.empty(0, dtype=torch.long, device=x.device)
+            return empty
 
         if per_rank_token == meta.per_rank_actual_token:
             local_len = int(x.shape[0])
@@ -560,8 +574,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 padded = x.new_empty((max_len, *x.shape[1:]))
                 gathered = x.new_empty((required_gathered_rows, *x.shape[1:]))
         old_cached_output = cached_output
-        if reuse_output and (
-            cached_output is None or cached_output.shape[0] < required_output_rows
+        if (
+            reuse_output
+            and not return_reorder_map
+            and (cached_output is None or cached_output.shape[0] < required_output_rows)
         ):
             cached_output = x.new_empty((required_output_rows, *x.shape[1:]))
         if (
@@ -578,9 +594,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         padded = padded[:max_len]
         gathered = gathered[:required_gathered_rows]
         output = (
-            cached_output[:required_output_rows]
-            if reuse_output
-            else x.new_empty((required_output_rows, *x.shape[1:]))
+            None
+            if return_reorder_map
+            else (
+                cached_output[:required_output_rows]
+                if reuse_output
+                else x.new_empty((required_output_rows, *x.shape[1:]))
+            )
         )
 
         # Equal-length shards are already collective-compatible. Skip the local
@@ -635,5 +655,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         group = get_parallel().attn_cp_group
         group.all_gather_into_tensor(gathered, gather_input)
+        if return_reorder_map:
+            return gathered, gather_indices
         torch.index_select(gathered, 0, gather_indices, out=output)
         return output

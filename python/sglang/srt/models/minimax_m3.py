@@ -47,6 +47,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -72,9 +73,9 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
-    hcu_moe_tp_matches_attention_tp,
     get_moe_a2a_backend,
     has_per_rank_fused_shared_slots,
+    hcu_moe_tp_matches_attention_tp,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -120,8 +121,8 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_gfx95_supported,
-    is_hip,
     is_hcu,
+    is_hip,
     is_npu,
     log_info_on_rank0,
     make_pp_layers,
@@ -1561,6 +1562,7 @@ class MiniMaxM3Attention(nn.Module):
             # perform the DCP-aware store instead.
             and not get_parallel().dcp_enabled
             and not is_prefill_context_parallel_enabled()
+            and not is_cp_v2_active(forward_batch)
             and idx_v is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k

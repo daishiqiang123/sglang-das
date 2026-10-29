@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_hcu
+from sglang.srt.utils import is_gfx95_supported, is_hcu, is_hip, is_npu
 
 _is_hcu = is_hcu()
 
@@ -1899,6 +1899,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     forward_batch.seq_lens.to(torch.int32) - int(_ndt)
                 ).clamp(min=0)
 
+        # Prefill eager GPU metadata is also immutable across model layers.
+        # Keep a strong ForwardBatch reference; init_forward_metadata clears it.
+        cache_eager_gpu = (
+            self.cache_flash_mla_prefill_metadata
+            and not self.is_npu
+            and not forward_batch.forward_mode.is_target_verify()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if cache_eager_gpu:
+            cached = self._flash_mla_prefill_index_meta.get("extend_meta")
+            if cached is not None and cached.forward_batch is forward_batch:
+                return cached.cu_seqlens, cached.seq_lens, cached.prefix_lens
+
         # NPU cache hit (same forward_batch).
         if (
             self.is_npu
@@ -1921,6 +1934,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
         else:
             prefix_lens = torch.zeros_like(seq_lens)
+
+        if cache_eager_gpu:
+            self._flash_mla_prefill_index_meta["extend_meta"] = SimpleNamespace(
+                forward_batch=forward_batch,
+                cu_seqlens=cu_seqlens,
+                seq_lens=seq_lens,
+                prefix_lens=prefix_lens,
+            )
 
         # NPU cache write.
         if self.is_npu:
@@ -1979,6 +2000,99 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._flash_mla_prefill_index_meta[cache_key] = meta
         return meta
 
+    def _try_store_query_sharded_cp_fp8_kv(
+        self, forward_batch, k, v, idx_k, idx_v, layer
+    ):
+        """Opt-in mixed-byte reorder/store fusion; preserve all other pool paths."""
+        if (
+            not _is_hcu
+            or os.environ.get("SGLANG_MINIMAX_CP_FP8_KV_EXCHANGE", "0") != "1"
+            or os.environ.get("SGLANG_MINIMAX_CP_FUSED_CACHE_SCATTER", "0") != "1"
+        ):
+            return False
+        strategy = get_cp_strategy()
+        pool = self.kv_pool
+        main = getattr(pool, "main_pool", None)
+        index = getattr(pool, "index_k_pool", None)
+        loc = forward_batch.out_cache_loc
+        scales = (layer.k_scale_float, layer.v_scale_float)
+        if (
+            strategy is None
+            or strategy.name != "zigzag"
+            or not hasattr(strategy, "gather_kv_cache_raw_reusable")
+            or main is None
+            or index is None
+            or idx_k is None
+            or idx_v is not None
+            or main.dtype != torch.float8_e4m3fn
+            or index.dtype != torch.bfloat16
+            or getattr(pool, "_enable_hisparse", False)
+            or any(x.dtype != torch.bfloat16 for x in (k, v, idx_k))
+            or tuple(k.shape[1:]) != (4, 128)
+            or tuple(v.shape[1:]) != (4, 128)
+            or tuple(idx_k.shape[1:]) != (1, 128)
+            or not isinstance(loc, torch.Tensor)
+            or loc.dtype != torch.int64
+            or loc.dim() != 1
+            or not loc.is_contiguous()
+            or not all(x.is_cuda and x.device == k.device for x in (k, v, idx_k, loc))
+            or not all(x.shape[0] == k.shape[0] for x in (v, idx_k))
+            or not all(
+                x.stride(2) == 1
+                and x.stride(1) == 128
+                and x.stride(0) >= x.shape[1] * 128
+                and x.stride(0) % 8 == 0
+                and x.data_ptr() % 16 == 0
+                for x in (k, v, idx_k)
+            )
+            or not all(
+                a is None or (type(a) in (int, float) and 1e-37 < a < 1e37)
+                for a in scales
+            )
+        ):
+            return False
+        meta = forward_batch.attn_cp_metadata
+        per_rank = meta.per_rank_logical_token or meta.per_rank_actual_token
+        if loc.numel() != sum(int(n) for n in per_rank):
+            return False
+        kc, vc = pool.get_kv_buffer(layer.layer_id)
+        ikc = pool.get_index_k_buffer(layer.layer_id)
+        if not (
+            tuple(kc.shape[1:]) == tuple(vc.shape[1:]) == (4, 128)
+            and tuple(ikc.shape[1:]) == (1, 128)
+        ):
+            return False
+        if not (
+            kc.dtype == vc.dtype == torch.float8_e4m3fn and ikc.dtype == torch.bfloat16
+        ):
+            return False
+        if not all(x.stride(2) == 1 and x.stride(1) == 128 for x in (kc, vc, ikc)):
+            return False
+        caches = [x.view(x.shape[0], -1).view(torch.uint8) for x in (kc, vc, ikc)]
+        if not all(
+            x.device == k.device
+            and x.stride(1) == 1
+            and x.stride(0) % 16 == 0
+            and x.data_ptr() % 16 == 0
+            and x.shape[0] == kc.shape[0]
+            for x in caches
+        ):
+            return False
+        from lightop.minimax_cp_cache_scatter import minimax_cp_cache_scatter
+        from lightop.minimax_cp_fp8_pack import minimax_cp_fp8_pack
+
+        packed = minimax_cp_fp8_pack(
+            k.flatten(1), v.flatten(1), idx_k.flatten(1), *scales
+        )
+        raw, reorder = strategy.gather_kv_cache_raw_reusable(packed, forward_batch)
+        minimax_cp_cache_scatter(raw, reorder, loc, *caches)
+        if not getattr(self, "_cp_fp8_raw_cache_logged", False):
+            logger.info(
+                "MiniMax CP fused raw reorder/cache store selected: FP8 KV + BF16 index K, 1280 bytes/token"
+            )
+            self._cp_fp8_raw_cache_logged = True
+        return True
+
     def _materialize_query_sharded_cp_kv(
         self,
         forward_batch: ForwardBatch,
@@ -1986,6 +2100,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         v: torch.Tensor,
         idx_k: Optional[torch.Tensor],
         idx_v: Optional[torch.Tensor],
+        layer=None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1998,6 +2113,74 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             raise RuntimeError(
                 "MiniMax query-sharded CP requires CP-v2 with --cp-strategy zigzag"
             )
+
+        # Task opt-in: quantize each local KV shard once, then exchange the
+        # exact E4M3FN cache bytes; index K remains lossless BF16. The normal
+        # BF16 transport path below remains the fallback for other contracts.
+        if os.environ.get("SGLANG_MINIMAX_CP_FP8_KV_EXCHANGE", "0") == "1" and _is_hcu:
+            main_pool = getattr(self.kv_pool, "main_pool", None)
+            index_pool = getattr(self.kv_pool, "index_k_pool", None)
+            scales = (
+                getattr(layer, "k_scale_float", None),
+                getattr(layer, "v_scale_float", None),
+            )
+            scale_ok = all(
+                s is None or (type(s) in (int, float) and 1e-37 < s < 1e37)
+                for s in scales
+            )
+            shape_ok = (
+                tuple(k.shape[1:]) == (4, 128)
+                and tuple(v.shape[1:]) == (4, 128)
+                and idx_k is not None
+                and tuple(idx_k.shape[1:]) == (1, 128)
+            )
+            if (
+                layer is not None
+                and idx_v is None
+                and shape_ok
+                and scale_ok
+                and main_pool is not None
+                and index_pool is not None
+                and main_pool.dtype == torch.float8_e4m3fn
+                and index_pool.dtype == torch.bfloat16
+                and not getattr(self.kv_pool, "_enable_hisparse", False)
+                and k.is_cuda
+                and v.device == k.device
+                and idx_k.device == k.device
+                and all(x.dtype == torch.bfloat16 for x in (k, v, idx_k))
+                and k.shape[0] == v.shape[0] == idx_k.shape[0]
+                and all(
+                    x.stride(2) == 1
+                    and x.stride(1) == 128
+                    and x.stride(0) >= x.shape[1] * 128
+                    and x.stride(0) % 8 == 0
+                    and x.data_ptr() % 16 == 0
+                    for x in (k, v, idx_k)
+                )
+            ):
+                from lightop.minimax_cp_fp8_pack import minimax_cp_fp8_pack
+
+                packed_local = minimax_cp_fp8_pack(
+                    k.flatten(1), v.flatten(1), idx_k.flatten(1), *scales
+                )
+                packed_full = strategy.gather_kv_cache_reusable(
+                    packed_local, forward_batch
+                )
+                rows = packed_full.shape[0]
+                if not getattr(self, "_cp_fp8_exchange_logged", False):
+                    logger.info(
+                        "MiniMax CP FP8 KV exchange selected: bytes/row=1280 "
+                        "(BF16 baseline=2304); BF16 index K preserved"
+                    )
+                    self._cp_fp8_exchange_logged = True
+                return (
+                    packed_full[:, :512].view(torch.float8_e4m3fn).view(rows, 4, 128),
+                    packed_full[:, 512:1024]
+                    .view(torch.float8_e4m3fn)
+                    .view(rows, 4, 128),
+                    packed_full[:, 1024:].view(torch.bfloat16).view(rows, 1, 128),
+                    None,
+                )
 
         if idx_v is not None and idx_k is None:
             raise RuntimeError("MiniMax index V cannot be materialized without index K")
@@ -2187,6 +2370,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if idx_q is None or idx_k is None:
             raise RuntimeError("MiniMax sparse prefill requires index Q and K")
         cp_active = is_cp_v2_active(forward_batch)
+        cp_cache_written = False
         if cp_active:
             if not self.enable_query_sharded_cp:
                 raise RuntimeError(
@@ -2198,9 +2382,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 raise RuntimeError(
                     "MiniMax query-sharded CP is currently implemented only for CUDA/HIP"
                 )
-            k, v, idx_k, idx_v = self._materialize_query_sharded_cp_kv(
-                forward_batch, k, v, idx_k, idx_v
+            cp_cache_written = self._try_store_query_sharded_cp_fp8_kv(
+                forward_batch, k, v, idx_k, idx_v, layer
             )
+            if not cp_cache_written:
+                k, v, idx_k, idx_v = self._materialize_query_sharded_cp_kv(
+                    forward_batch, k, v, idx_k, idx_v, layer=layer
+                )
             global _minimax_sparse_cp_logged
             if not _minimax_sparse_cp_logged:
                 logger.info(
@@ -2208,7 +2396,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "cp_size=%s, local_q=%s, materialized_kv=%s",
                     get_cp_strategy().cp_size,
                     q.shape[0],
-                    k.shape[0],
+                    forward_batch.out_cache_loc.numel()
+                    if cp_cache_written
+                    else k.shape[0],
                 )
                 _minimax_sparse_cp_logged = True
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
@@ -2219,7 +2409,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # the complete new-chunk sparse KV, so overwrite that partial write
         # with the globally materialized tensors.
         store_loc = forward_batch.out_cache_loc
-        if cp_active or not kv_cached_by_fusion:
+        if (cp_active or not kv_cached_by_fusion) and not cp_cache_written:
             if idx_k is None:
                 self.kv_pool.set_kv_buffer(
                     layer,
@@ -2488,6 +2678,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     segment_slot_ids=None,
                     flash_mla_prefill_k_end=None,
                 ):
+                    index_view = None
+                    if (
+                        self.cache_flash_mla_prefill_metadata
+                        and self.use_flash_mla_gfx938_indexer
+                    ):
+                        view_key = ("index_page_view", int(segment_max_k))
+                        index_view = self._flash_mla_prefill_index_meta.get(view_key)
+                        if index_view is None:
+                            from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+                                _flash_mla_prefill_index_view,
+                            )
+
+                            index_view = _flash_mla_prefill_index_view(
+                                self._flash_mla_page_table,
+                                flash_mla_safe_pages,
+                                segment_max_k,
+                                self.block_size_k,
+                            )
+                            self._flash_mla_prefill_index_meta[view_key] = index_view
                     return minimax_sparse_prefill(
                         segment_q,
                         k_cache,
@@ -2532,6 +2741,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         ),
                         flash_mla_prefill_k_end=flash_mla_prefill_k_end,
                         flash_mla_safe_pages=flash_mla_safe_pages,
+                        flash_mla_prefill_index_view=index_view,
                         seqlens_cpu=segment_q_lens_cpu,
                         q_scale=layer.q_scale_float,
                         k_scale=layer.k_scale_float,
