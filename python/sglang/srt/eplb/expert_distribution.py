@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from abc import ABC
 from collections import deque
@@ -83,6 +84,14 @@ def megamoe_prefill_only_recorder_enabled() -> bool:
 
 # non-hip platform always return True
 def should_record_forward_pass(forward_batch: ForwardBatch) -> bool:
+    # Explicit MiniMax prefill launch opt-in; decode/capture must not train its layout.
+    if os.environ.get("SGLANG_MINIMAX_EPLB_PREFILL_ONLY", "0") == "1":
+        return (
+            not _is_model_capture_mode()
+            and forward_batch.forward_mode
+            in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL)
+            and int(forward_batch.extend_num_tokens or 0) > 0
+        )
     if not megamoe_prefill_only_recorder_enabled():
         return True
     if _is_model_capture_mode():
@@ -103,6 +112,8 @@ def should_advance_eplb_counter(forward_batch: ForwardBatch) -> bool:
     counter has to advance in lockstep across ranks, so it keys off the globally
     synchronized `is_extend_in_batch` rather than this rank's forward mode.
     """
+    if os.environ.get("SGLANG_MINIMAX_EPLB_PREFILL_ONLY", "0") == "1":
+        return not _is_model_capture_mode() and forward_batch.is_extend_in_batch
     if not megamoe_prefill_only_recorder_enabled():
         return True
     return forward_batch.is_extend_in_batch
