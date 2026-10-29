@@ -91,6 +91,8 @@ _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _HCU_FUSED_QUANT_SCATTER = get_bool_env_var(
     "SGLANG_OPT_DG_HCU_FUSED_QUANT_SCATTER", "false"
 )
+# Default-off: current native HCU row quantizer + OAI contiguous prefill only.
+_HCU_CONTIG_OAI_QUANT = get_bool_env_var("SGLANG_OPT_DG_HCU_CONTIG_OAI_QUANT", "false")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 _hcu_masked_output_buffer: Optional[torch.Tensor] = None
 
@@ -596,6 +598,55 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         return down_output
 
+    def _can_fuse_hcu_contiguous_oai_quant(
+        self, gateup_output: torch.Tensor, gateup_size: int
+    ) -> bool:
+        """Require the original layout, quantization contract and LightOp HIP."""
+        if not (
+            _HCU_CONTIG_OAI_QUANT
+            and self.config.gemm1_alpha is not None
+            and self.config.gemm1_clamp_limit is not None
+            and not self.config.gate_up_interleaved
+            and gateup_output.dtype == torch.bfloat16
+            and gateup_output.is_cuda
+            and gateup_output.ndim == 2
+            and gateup_output.is_contiguous()
+            and gateup_output.shape[1] == gateup_size
+            and gateup_size % 2 == 0
+            and 1 <= gateup_size // 2 <= 8192
+        ):
+            return False
+
+        import math
+
+        alpha = float(self.config.gemm1_alpha)
+        beta = float(self.config.gemm1_beta or 1.0)
+        limit = float(self.config.gemm1_clamp_limit)
+        if not (
+            math.isfinite(alpha)
+            and alpha > 0
+            and math.isfinite(beta)
+            and math.isfinite(limit)
+            and limit > 0
+        ):
+            return False
+
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            _hip_per_token_quant_fp8,
+            fp8_dtype,
+        )
+
+        # Preserve the legacy native quantizer's FP8/zero-row contract. Other
+        # formats and the existing quantizer fallback keep their original path.
+        if _hip_per_token_quant_fp8 is None or fp8_dtype != torch.float8_e4m3fn:
+            return False
+
+        from sglang.kernels.ops.moe.minimax_m3_swiglu import (
+            has_lightop_contiguous_oai_quant,
+        )
+
+        return has_lightop_contiguous_oai_quant()
+
     def _run_hcu_contiguous_gemm(
         self,
         runner_input: DeepGemmRunnerInput,
@@ -629,31 +680,47 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.config.gemm1_alpha is not None:
-            if self.config.gate_up_interleaved:
-                raise ValueError("MiniMax HCU DeepGEMM expects split [gate;up] weights")
-            from sglang.kernels.ops.moe.minimax_m3_swiglu import swiglu_oai_split
+        if self._can_fuse_hcu_contiguous_oai_quant(gateup_output, gateup_size):
+            from sglang.kernels.ops.moe.minimax_m3_swiglu import (
+                swiglu_oai_fp8_quant_split,
+            )
 
-            down_input_bf16 = swiglu_oai_split(
+            down_input, down_input_scale = swiglu_oai_fp8_quant_split(
                 gateup_output,
                 alpha=float(self.config.gemm1_alpha),
                 beta=float(self.config.gemm1_beta or 1.0),
-                limit=self.config.gemm1_clamp_limit,
-                out_dtype=torch.bfloat16,
+                limit=float(self.config.gemm1_clamp_limit),
             )
+            del gateup_output
         else:
-            gate, up = gateup_output.chunk(2, dim=-1)
-            down_input_bf16 = torch.nn.functional.silu(gate) * up
-        del gateup_output
+            # Original two-step path is the default and all unsupported cases.
+            if self.config.gemm1_alpha is not None:
+                if self.config.gate_up_interleaved:
+                    raise ValueError(
+                        "MiniMax HCU DeepGEMM expects split [gate;up] weights"
+                    )
+                from sglang.kernels.ops.moe.minimax_m3_swiglu import swiglu_oai_split
 
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_quant_fp8,
-        )
+                down_input_bf16 = swiglu_oai_split(
+                    gateup_output,
+                    alpha=float(self.config.gemm1_alpha),
+                    beta=float(self.config.gemm1_beta or 1.0),
+                    limit=self.config.gemm1_clamp_limit,
+                    out_dtype=torch.bfloat16,
+                )
+            else:
+                gate, up = gateup_output.chunk(2, dim=-1)
+                down_input_bf16 = torch.nn.functional.silu(gate) * up
+            del gateup_output
 
-        down_input, down_input_scale = sglang_per_token_quant_fp8(
-            down_input_bf16.contiguous()
-        )
-        del down_input_bf16
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_quant_fp8,
+            )
+
+            down_input, down_input_scale = sglang_per_token_quant_fp8(
+                down_input_bf16.contiguous()
+            )
+            del down_input_bf16
         down_output = torch.empty(
             (all_tokens, hidden_size),
             device=down_input.device,

@@ -204,3 +204,43 @@ def swiglu_oai_mxfp8_quant(
     return q.reshape(*orig_shape[:-1], n_inter), scales.reshape(
         *orig_shape[:-1], n_inter // 32
     )
+
+
+# Opt-in contiguous DeepEP prefill fusion is provided by LightOp HIP.
+# Preserve the other activation/MXFP8 paths in this module.
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _lightop_contiguous_oai_quant():
+    """Resolve optional native capability once, before graph capture."""
+    try:
+        from lightop import op, swiglu_oai_fp8_quant_contiguous
+
+        if not callable(getattr(op, "swiglu_oai_fp8_quant_contiguous", None)):
+            # Isolated incremental runtime retains the installed LightOp op.so.
+            from lightop.lightop_oai_contig import (
+                swiglu_oai_fp8_quant_contiguous as _native,
+            )
+
+            if not callable(_native):
+                return None
+    except ImportError:
+        return None
+    return (
+        swiglu_oai_fp8_quant_contiguous
+        if callable(swiglu_oai_fp8_quant_contiguous)
+        else None
+    )
+
+
+def has_lightop_contiguous_oai_quant():
+    return _lightop_contiguous_oai_quant() is not None
+
+
+def swiglu_oai_fp8_quant_split(x, alpha=1.702, beta=1.0, limit=7.0):
+    """BF16 split OAI -> FP8 E4M3FN, preserving native row scale semantics."""
+    native = _lightop_contiguous_oai_quant()
+    if native is None:
+        raise RuntimeError("LightOp contiguous OAI+FP8 native capability is missing")
+    return native(x, alpha=alpha, beta=beta, limit=limit)
