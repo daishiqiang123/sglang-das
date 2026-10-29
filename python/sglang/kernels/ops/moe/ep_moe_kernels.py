@@ -17,12 +17,10 @@ from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
-
-from sglang.srt.utils import is_hcu
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import ceil_div, is_cuda, is_hip, is_musa
+from sglang.srt.utils import ceil_div, is_cuda, is_hcu, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -3596,7 +3594,7 @@ def build_m_indices_kernel(
     tl.store(m_indices_ptr + offs, result, mask=mask)
 
 
-def build_m_indices_triton(topk_ids, device, num_experts):
+def build_m_indices_triton(topk_ids, device, num_experts, total_elements=None):
 
     actual_counts = torch.zeros(num_experts, device=topk_ids.device, dtype=torch.int32)
     grid = (triton.cdiv(topk_ids.numel(), 1024),)
@@ -3609,8 +3607,15 @@ def build_m_indices_triton(topk_ids, device, num_experts):
 
     prefix_slots = torch.cumsum(slots_per_expert, dim=0)
 
-    total_slots = prefix_slots[-1].item()
-    total_elements = total_slots * 256
+    # DeepEP normal already returns CPU-known padded expert counts. Its caller
+    # allocates every GEMM buffer from that same sum; avoid a redundant D2H
+    # scalar read (and stream synchronization) when the size is supplied.
+    if total_elements is None:
+        total_slots = prefix_slots[-1].item()
+        total_elements = total_slots * 256
+    else:
+        assert isinstance(total_elements, int) and total_elements >= 0
+        assert total_elements % 256 == 0
     m_indices = torch.full(
         (total_elements,),
         -1,

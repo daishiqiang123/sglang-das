@@ -1878,6 +1878,11 @@ def pre_permute_deepep_normal_to_deep_gemm(
             topk_ids,
             hidden_states_device,
             len(num_recv_tokens_per_expert),
+            total_elements=(
+                all_tokens
+                if get_bool_env_var("SGLANG_HCU_DEEPEP_NO_M_INDICES_SYNC", "false")
+                else None
+            ),
         )
         if m_indices.numel() != all_tokens:
             raise ValueError(
