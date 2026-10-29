@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused MiniMax-M3 per-head Gemma Q/K RMSNorm + partial RoPE for ROCm."""
 
+import os
 from typing import Tuple
 
 import torch
@@ -316,6 +317,56 @@ def sparse_qk_index_gemma_rmsnorm_rope(
     is_neox_style: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse main and sparse-index Gemma Q/K RMSNorm + RoPE into one launch."""
+    # Keep the original Triton implementation as the baseline/fallback.
+    if (
+        os.environ.get("SGLANG_USE_LIGHTOP_MINIMAX_QK_ROPE", "0") == "1"
+        and head_dim == 128
+        and q.dim() == k.dim() == idx_q.dim() == idx_k.dim() == 2
+        and (q.shape[1], k.shape[1], idx_q.shape[1], idx_k.shape[1])
+        == (8192, 512, 512, 128)
+        and all(
+            x.dtype == torch.bfloat16
+            for x in (
+                q,
+                k,
+                idx_q,
+                idx_k,
+                q_weight,
+                k_weight,
+                idx_q_weight,
+                idx_k_weight,
+            )
+        )
+        and cos_sin_cache.dtype in (torch.float32, torch.bfloat16)
+        and cos_sin_cache.is_contiguous()
+        and positions.dtype in (torch.int32, torch.int64)
+        and positions.is_contiguous()
+        and all(
+            w.is_contiguous() for w in (q_weight, k_weight, idx_q_weight, idx_k_weight)
+        )
+    ):
+        try:
+            from lightop import minimax_qk_norm_rope, supports_minimax_qk_norm_rope
+        except ImportError:
+            pass
+        else:
+            if supports_minimax_qk_norm_rope():
+                return minimax_qk_norm_rope(
+                    q,
+                    k,
+                    idx_q,
+                    idx_k,
+                    q_weight,
+                    k_weight,
+                    idx_q_weight,
+                    idx_k_weight,
+                    positions,
+                    cos_sin_cache,
+                    eps,
+                    head_dim,
+                    rotary_dim,
+                    is_neox_style,
+                )
     assert q.dim() == k.dim() == idx_q.dim() == idx_k.dim() == 2
     assert positions.dim() == 1
     assert q.shape[0] == k.shape[0] == idx_q.shape[0] == idx_k.shape[0]
