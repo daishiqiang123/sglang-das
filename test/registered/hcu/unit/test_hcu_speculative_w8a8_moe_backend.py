@@ -15,6 +15,7 @@
 import ast
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from sglang.test.ci.ci_register import register_hcu_ci
@@ -82,6 +83,71 @@ class TestHcuSpeculativeW8A8MoeBackend(unittest.TestCase):
                         use_deepep=use_deepep,
                     )
                 )
+
+    def test_explicit_aiter_keeps_its_weight_layout(self):
+        helper = _load_helper()
+        for use_deepep in (False, True):
+            for in_scope in (False, True):
+                for algorithm in (None, "DSPARK", "EAGLE"):
+                    with self.subTest(
+                        deepep=use_deepep, scope=in_scope, algo=algorithm
+                    ):
+                        self.assertFalse(
+                            helper(
+                                enabled=True,
+                                in_speculative_a2a_scope=in_scope,
+                                speculative_algorithm=algorithm,
+                                use_deepep=use_deepep,
+                                explicit_aiter_backend=True,
+                            )
+                        )
+
+    def test_legacy_deepgemm_pack_excludes_explicit_aiter(self):
+        tree = ast.parse(MOE_SOURCE.read_text())
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "CompressedTensorsW8A8Fp8MoE"
+        )
+        method = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "process_weights_after_loading"
+        )
+        branch = next(
+            n
+            for n in ast.walk(method)
+            if isinstance(n, ast.If)
+            and any(
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "_prepare_dsv4_channel_fp8_deepgemm_weights"
+                for stmt in n.body
+            )
+        )
+        condition = compile(ast.Expression(branch.test), str(MOE_SOURCE), "eval")
+        namespace = {
+            "self": SimpleNamespace(
+                weight_quant=SimpleNamespace(strategy="channel"), use_deepep=True
+            ),
+            "QuantizationStrategy": SimpleNamespace(CHANNEL="channel"),
+            "_use_deepgemm_moe": True,
+            "_is_hcu": True,
+        }
+        for backend, expected in (
+            ("aiter", False),
+            ("deep_gemm", False),
+            ("auto", True),
+            ("triton", True),
+        ):
+            with self.subTest(backend=backend):
+                namespace["get_moe_runner_backend"] = lambda b=backend: SimpleNamespace(
+                    is_deep_gemm=lambda: b == "deep_gemm",
+                    is_aiter=lambda: b == "aiter",
+                )
+                self.assertEqual(eval(condition, namespace), expected)
 
     def test_disabled_hcu_backend_stays_disabled(self):
         helper = _load_helper()
