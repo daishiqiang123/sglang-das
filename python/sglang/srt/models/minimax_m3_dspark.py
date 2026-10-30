@@ -69,12 +69,17 @@ class MiniMaxDSparkRotaryEmbedding(nn.Module):
         if positions.numel():
             q_heads = query.shape[-1] // self.rotary.head_size
             if q_heads not in self._logged_q_heads:
-                logger.info(
+                logger.debug(
                     "MiniMax DSpark HCU RoPE: q_dtype=%s k_dtype=%s "
                     "source_cache=%s kernel_cache=%s q_heads=%d q_stride=%s "
                     "k_stride=%s rotary_dim=%d.",
-                    query.dtype, key.dtype, self.rotary.cos_sin_cache.dtype,
-                    cache.dtype, q_heads, query.stride(), key.stride(),
+                    query.dtype,
+                    key.dtype,
+                    self.rotary.cos_sin_cache.dtype,
+                    cache.dtype,
+                    q_heads,
+                    query.stride(),
+                    key.stride(),
                     self.rotary.rotary_dim,
                 )
                 self._logged_q_heads.add(q_heads)

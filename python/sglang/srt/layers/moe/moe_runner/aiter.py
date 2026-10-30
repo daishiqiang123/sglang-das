@@ -71,6 +71,25 @@ _MOE_SORTING_DISPATCH_POLICY = envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get
 
 _AITER_UNIFIED_MOE_CONFIG_CACHE: dict[tuple, Any] = {}
 _AITER_UNIFIED_MOE_FALLBACK_WARNINGS: set[tuple] = set()
+_AITER_UNIFIED_MOE_SELECTION_LOGGED = False
+
+
+def _log_unified_moe_selection(*args: Any) -> None:
+    """Keep one startup selection at INFO; per-shape details remain at DEBUG."""
+    global _AITER_UNIFIED_MOE_SELECTION_LOGGED
+
+    first_on_primary_rank = not _AITER_UNIFIED_MOE_SELECTION_LOGGED and (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    log = logger.info if first_on_primary_rank else logger.debug
+    log(
+        "AITER unified MoE selected: M=%s, E=%s, N1=%s, N2=%s, "
+        "K=%s, top_k=%s, dtype=%s, quant=%s, solution=%s, "
+        "need_shuffle=%s",
+        *args,
+    )
+    if first_on_primary_rank:
+        _AITER_UNIFIED_MOE_SELECTION_LOGGED = True
 
 
 class _AiterWeightLayout(msgspec.Struct, frozen=True, kw_only=True):
@@ -1133,10 +1152,7 @@ class AiterRunnerCore(MoeRunnerCore):
                 )
                 self._warned_unified_fallbacks.add(warning_key)
         else:
-            logger.info(
-                "AITER unified MoE selected: M=%s, E=%s, N1=%s, N2=%s, "
-                "K=%s, top_k=%s, dtype=%s, quant=%s, solution=%s, "
-                "need_shuffle=%s",
+            _log_unified_moe_selection(
                 runner_input.hidden_states.shape[0],
                 w1_shape[0],
                 w1_shape[1],
