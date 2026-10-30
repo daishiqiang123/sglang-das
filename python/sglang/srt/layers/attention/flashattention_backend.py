@@ -361,6 +361,7 @@ class FlashAttentionBackend(AttentionBackend):
         # HCU uses its established FlashAttention interface and must not
         # select CUDA-only FA3/FA4 wrappers.
         self.fa_impl_ver = fa_impl_ver
+        self._decode_uses_static_max_seqlen_k = not is_hcu() and fa_impl_ver == 4
         if is_hcu():
             self._get_scheduler_metadata = None
         elif self.fa_impl_ver == 3:
