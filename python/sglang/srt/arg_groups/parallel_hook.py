@@ -96,9 +96,7 @@ def _hcu_query_sharded_prefill_cp_enabled(cfg) -> bool:
     """Allow the explicit single-node HCU query-sharded CP-v2 topology."""
     return (
         is_hcu()
-        and envs.SGLANG_ENABLE_CP_V2.get()
-        and os.environ.get("SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP", "0")
-        in ("1", "true", "True")
+        and envs.SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP.get()
         and cfg.cp_strategy == "zigzag"
         and cfg.pp_size == 1
         and cfg.nnodes == 1

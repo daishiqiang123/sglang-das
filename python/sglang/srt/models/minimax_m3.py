@@ -35,10 +35,6 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
 )
-from sglang.srt.distributed import (
-    moe_tensor_model_parallel_all_reduce,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -206,12 +202,8 @@ _use_minimax_aiter_fused_ar_rmsnorm = _is_hcu and get_bool_env_var(
 _use_minimax_router_gemv = _is_hcu and get_bool_env_var(
     "SGLANG_OPT_USE_MINIMAX_ROUTER_GEMV", default="false"
 )
-_minimax_router_gemv_block_k = int(
-    os.environ.get("SGLANG_MINIMAX_ROUTER_GEMV_BLOCK_K", "256")
-)
-_minimax_router_gemv_num_warps = int(
-    os.environ.get("SGLANG_MINIMAX_ROUTER_GEMV_NUM_WARPS", "4")
-)
+_minimax_router_gemv_block_k = 1024
+_minimax_router_gemv_num_warps = 1
 _minimax_router_gemv_logged = False
 if _use_minimax_router_gemv:
     from sglang.kernels.ops.moe.minimax_router_gemv import (

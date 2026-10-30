@@ -116,9 +116,17 @@ class TestCPStrategyUnit(CustomTestCase):
         from sglang.srt.layers.cp.utils import enable_cp_v2
 
         with patch("sglang.srt.utils.is_hcu", return_value=True):
-            for enabled in (False, True):
-                with envs.SGLANG_ENABLE_CP_V2.override(enabled):
-                    self.assertEqual(enable_cp_v2(), enabled)
+            for legacy_enabled in (False, True):
+                for query_sharded in (False, True):
+                    with (
+                        envs.SGLANG_ENABLE_CP_V2.override(legacy_enabled),
+                        envs.SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP.override(
+                            query_sharded
+                        ),
+                    ):
+                        self.assertEqual(
+                            enable_cp_v2(), legacy_enabled or query_sharded
+                        )
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):

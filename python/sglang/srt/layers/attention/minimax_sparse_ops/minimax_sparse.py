@@ -78,7 +78,7 @@ def _flash_mla_prefill_index_view(page_table, safe_pages, max_seqlen_k, block_si
     Decode graph callers retain the full context page table. Keep at least one
     128-page selection tile so forced prefix pages and padding remain supported.
     """
-    if not envs.SGLANG_MINIMAX_FLASH_MLA_PREFILL_LIVE_EXTENT.get():
+    if not envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938.get():
         return page_table, safe_pages
     if max_seqlen_k <= 0:
         return page_table, safe_pages
@@ -196,10 +196,11 @@ def minimax_sparse_prefill(
     while block_size_q > max_block_size_q:
         block_size_q //= 2
     # FlashMLA indexer/main consume cu_seqlens directly; Triton seqblock
-    # metadata is dead work on this full FlashMLA path. Keep the old path
-    # available for the controlled A/B and every fallback backend.
+    # metadata is dead work on this full FlashMLA path. The metadata
+    # reuse switch also skips it; fallback backends retain their preparation.
     skip_unused_seqblocks = (
-        os.environ.get("SGLANG_MINIMAX_SKIP_UNUSED_PREFILL_SEQBLOCKS", "0") == "1"
+        os.environ.get("SGLANG_MINIMAX_CACHE_PREFILL_INDEX_METADATA", "0")
+        in ("1", "true", "True")
         and use_flash_mla_gfx938
         and use_flash_mla_gfx938_indexer
     )

@@ -232,9 +232,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # are materialized on every CP rank.  This preserves the existing
         # exact local Top-K algorithm and avoids a distributed Top-K in the
         # first implementation.
-        self.enable_query_sharded_cp = os.environ.get(
-            "SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP", "0"
-        ) in ("1", "true", "True")
+        self.enable_query_sharded_cp = (
+            envs.SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP.get()
+        )
         # Share one selected sparse-KV block set across a small group of
         # adjacent prefill queries.  The original GPU default (1) launches one
         # program per query and is prohibitively slow for MiniMax-M3's 16K
@@ -362,19 +362,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     self.block_size_k,
                 )
 
-        # Explicit MiniMax-only FlashMLA backend. Stage-3 is independently
-        # selectable; the indexer gate below additionally replaces Stage-1/2.
+        # One switch selects the complete contract-checked FlashMLA backend.
         self.use_flash_mla_gfx938 = (
             _is_hcu and envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938.get()
         )
-        self.use_flash_mla_gfx938_decode = (
-            self.use_flash_mla_gfx938
-            and envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_DECODE.get()
-        )
-        self.use_flash_mla_gfx938_indexer = (
-            self.use_flash_mla_gfx938
-            and envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_INDEXER.get()
-        )
+        self.use_flash_mla_gfx938_decode = self.use_flash_mla_gfx938
+        self.use_flash_mla_gfx938_indexer = self.use_flash_mla_gfx938
         if self.use_flash_mla_gfx938:
             if self.is_npu:
                 raise RuntimeError(
@@ -434,7 +427,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         contract_errors.append(
                             "decode indexer requires capture-safe upstream Stage1 "
                             "(max_kv_len interface); load the rebuilt FlashMLA wheel "
-                            "or disable the FlashMLA indexer"
+                            "or disable the FlashMLA backend"
                         )
                 if self.score_type != "max":
                     contract_errors.append(
@@ -2007,7 +2000,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if (
             not _is_hcu
             or os.environ.get("SGLANG_MINIMAX_CP_FP8_KV_EXCHANGE", "0") != "1"
-            or os.environ.get("SGLANG_MINIMAX_CP_FUSED_CACHE_SCATTER", "0") != "1"
         ):
             return False
         strategy = get_cp_strategy()
