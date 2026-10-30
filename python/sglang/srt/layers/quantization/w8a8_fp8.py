@@ -56,7 +56,10 @@ if TYPE_CHECKING:
 
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hcu = is_hcu()
-_use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
+_use_fp8_w8a8_moe = get_bool_env_var(
+    "SGLANG_USE_FP8_W8A8_MOE",
+    default="true" if get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE") else "false",
+)
 _use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 
 

@@ -153,7 +153,10 @@ _is_npu = is_npu()
 _is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
+_use_fp8_w8a8_moe = get_bool_env_var(
+    "SGLANG_USE_FP8_W8A8_MOE",
+    default="true" if get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE") else "false",
+)
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 _use_w4a8_contiguous_hipc = get_bool_env_var("SGLANG_USE_W4A8_CONTIGUOUS_HIPC")

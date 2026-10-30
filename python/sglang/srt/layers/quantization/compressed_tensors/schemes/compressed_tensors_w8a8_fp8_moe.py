@@ -41,7 +41,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_exec
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, set_weight_attrs
@@ -58,7 +58,10 @@ __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 _is_hip = is_hip()
 _is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
+_use_fp8_w8a8_moe = get_bool_env_var(
+    "SGLANG_USE_FP8_W8A8_MOE",
+    default="true" if get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE") else "false",
+)
 _use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_aiter_fp8_w8a8_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
 _use_shuffle = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE")

@@ -92,7 +92,7 @@ _HCU_FUSED_QUANT_SCATTER = get_bool_env_var(
     "SGLANG_OPT_DG_HCU_FUSED_QUANT_SCATTER", "false"
 )
 # Default-off: current native HCU row quantizer + OAI contiguous prefill only.
-_HCU_CONTIG_OAI_QUANT = get_bool_env_var("SGLANG_OPT_DG_HCU_CONTIG_OAI_QUANT", "false")
+_HCU_CONTIG_OAI_QUANT = envs.SGLANG_USE_LIGHTOP_OAI_FP8_QUANT.get()
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 _hcu_masked_output_buffer: Optional[torch.Tensor] = None
 
