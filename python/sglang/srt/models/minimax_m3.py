@@ -271,6 +271,18 @@ if _is_hip and envs.SGLANG_USE_AITER.get():
 logger = logging.getLogger(__name__)
 
 
+def _is_minimax_pp_missing_parameter(name: str, model: nn.Module) -> bool:
+    """Identify weights owned by another PP stage without hiding unknown names."""
+    module = model
+    for part in name.split(".")[:-1]:
+        if isinstance(module, PPMissingLayer):
+            return True
+        module = getattr(module, part, None)
+        if module is None:
+            return False
+    return isinstance(module, PPMissingLayer)
+
+
 class MultiHeadRMSNorm(nn.Module):
     def __init__(
         self,
@@ -2372,6 +2384,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            if _is_minimax_pp_missing_parameter(name, self):
+                continue
             layer_id = get_layer_id(name)
             if layer_id is not None and (
                 layer_id < self.model.start_layer or layer_id >= self.model.end_layer

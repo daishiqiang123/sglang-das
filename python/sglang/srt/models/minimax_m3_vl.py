@@ -29,6 +29,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
     MiniMaxM3SparseForCausalLM,
+    _is_minimax_pp_missing_parameter,
     build_minimax_fused_qkv_index,
     get_spec_layer_idx_from_weight_name,
 )
@@ -362,6 +363,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         llm_stacked_params_mapping: list,
         expert_params_mapping: list,
     ) -> None:
+        if _is_minimax_pp_missing_parameter(name, self):
+            return
         if "block_sparse_moe" in name:
             name = name.replace("block_sparse_moe", "mlp")
 
