@@ -69,6 +69,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
+    get_deepep_mode,
     get_moe_a2a_backend,
     has_per_rank_fused_shared_slots,
     hcu_moe_tp_matches_attention_tp,
@@ -485,6 +486,18 @@ class MiniMaxM3MLP(nn.Module):
         return x
 
 
+def _use_deepep_shared_overlap() -> bool:
+    option = envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP
+    if option.is_set():
+        return option.get()
+    return (
+        get_parallel().attn_cp_size == 8
+        and envs.SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP.get()
+        and get_moe_a2a_backend().is_deepep()
+        and get_deepep_mode().is_normal()
+    )
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
 
@@ -666,12 +679,15 @@ class MiniMaxM3MoE(nn.Module):
             )
         self.enable_deepep_shared_expert_overlap = (
             _is_hcu
-            and envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP.get()
+            and _use_deepep_shared_overlap()
             and get_moe_a2a_backend().is_deepep()
             and parallel.moe_ep_size > 1
             and self.shared_experts is not None
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
+        )
+        self.deepep_shared_overlap_prefill_only = (
+            not envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP.is_set()
         )
         if self.enable_deepep_shared_expert_overlap:
             logger.info_once(
@@ -773,9 +789,13 @@ class MiniMaxM3MoE(nn.Module):
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_decode()
         )
+        overlap_shared = self.enable_deepep_shared_expert_overlap and (
+            not self.deepep_shared_overlap_prefill_only
+            or forward_batch.forward_mode.is_extend_without_speculative()
+        )
         current_stream = None
         if hidden_states.shape[0] > 0:
-            if self.enable_deepep_shared_expert_overlap:
+            if overlap_shared:
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
@@ -786,7 +806,7 @@ class MiniMaxM3MoE(nn.Module):
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_experts
                 )
-            elif not self.enable_deepep_shared_expert_overlap:
+            elif not overlap_shared:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -805,7 +825,7 @@ class MiniMaxM3MoE(nn.Module):
 
         if enable_npu_dual_stream:
             wait_share_stream()
-        elif self.enable_deepep_shared_expert_overlap and hidden_states.shape[0] > 0:
+        elif overlap_shared and hidden_states.shape[0] > 0:
             assert current_stream is not None
             current_stream.wait_stream(self.alt_stream)
 
@@ -2078,7 +2098,7 @@ class MiniMaxM3Model(nn.Module):
             alt_stream = get_stream("alt")
         elif _is_hcu and (
             envs.SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP.get()
-            or envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP.get()
+            or _use_deepep_shared_overlap()
         ):
             # A dedicated name avoids coupling the MoE graph dependencies to
             # unrelated cache/attention users of the legacy "alt" stream.
