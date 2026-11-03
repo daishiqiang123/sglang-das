@@ -203,6 +203,7 @@ def _should_use_ascend_tp_dispatcher(moe_runner_config: MoeRunnerConfig) -> bool
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
+    deepep_recv_hook: bool = False,
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and (
@@ -248,7 +249,7 @@ def create_moe_dispatcher(
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=envs.SGLANG_DEEPEP_ASYNC_FINISH.get(),
-            return_recv_hook=not is_hcu(),
+            return_recv_hook=not is_hcu() or deepep_recv_hook,
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
@@ -455,6 +456,7 @@ class FusedMoE(torch.nn.Module):
         num_dispatch_experts: Optional[int] = None,
         num_dispatch_local_experts: Optional[int] = None,
         local_shared_experts_without_dispatch: bool = False,
+        deepep_recv_hook: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -660,7 +662,9 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(
-            self.moe_runner_config, quant_method=self.quant_method
+            self.moe_runner_config,
+            quant_method=self.quant_method,
+            deepep_recv_hook=deepep_recv_hook,
         )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.

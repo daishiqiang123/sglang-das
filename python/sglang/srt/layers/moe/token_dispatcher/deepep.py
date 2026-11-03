@@ -1498,7 +1498,8 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_combine_hook(self, hook):
         if (
-            self.deepep_mode != DeepEPMode.LOW_LATENCY
+            not self.deepep_mode.enable_low_latency()
+            or self._get_impl() is not self._low_latency_dispatcher
             or not self._low_latency_dispatcher.return_recv_hook
         ):
             raise ValueError(

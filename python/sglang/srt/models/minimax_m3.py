@@ -45,6 +45,7 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
+    get_is_extend_in_batch,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
@@ -71,9 +72,12 @@ from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     has_per_rank_fused_shared_slots,
     hcu_moe_tp_matches_attention_tp,
+    is_sbo_enabled,
     is_shared_experts_fusion_disabled,
+    is_tbo_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.mxfp8_input import (
@@ -479,6 +483,9 @@ class MiniMaxM3MLP(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        return self.forward_down(gate_up)
+
+    def forward_down(self, gate_up: torch.Tensor) -> torch.Tensor:
         x = self._swiglu_oai_mxfp8(gate_up)
         if x is None:
             x = self.act_fn(gate_up)
@@ -594,6 +601,18 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.e_score_correction_bias = None
 
+        self.split_shared_experts = (
+            _is_hcu
+            and envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP.get()
+            and get_moe_a2a_backend().is_deepep()
+            and get_moe_runner_backend().is_deep_gemm()
+            and get_deepep_mode().enable_low_latency()
+            and parallel.attn_dp_size == parallel.moe_ep_size == 8
+            and self.n_shared_experts
+            and not self.num_fused_shared_experts
+            and not is_sbo_enabled()
+            and not is_tbo_enabled()
+        )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_physical_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -622,6 +641,7 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
+            **({"deepep_recv_hook": True} if self.split_shared_experts else {}),
         )
         self.experts.moe_runner_config.is_minimax_m3 = True
         self.topk = TopK(
@@ -793,6 +813,12 @@ class MiniMaxM3MoE(nn.Module):
             not self.deepep_shared_overlap_prefill_only
             or forward_batch.forward_mode.is_extend_without_speculative()
         )
+        split_shared = (
+            self.split_shared_experts
+            and hidden_states.shape[0] > 0
+            and get_deepep_mode().resolve(get_is_extend_in_batch()).is_low_latency()
+        )
+        overlap_shared = overlap_shared and not split_shared
         current_stream = None
         if hidden_states.shape[0] > 0:
             if overlap_shared:
@@ -806,7 +832,7 @@ class MiniMaxM3MoE(nn.Module):
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_experts
                 )
-            elif not overlap_shared:
+            elif not (overlap_shared or split_shared):
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -821,7 +847,12 @@ class MiniMaxM3MoE(nn.Module):
 
         # DeepEP returns the complete per-token routed result (no TP all-reduce here);
         # shared experts are replicated (tp_size=1), so both add directly.
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if split_shared:
+            final_hidden_states, shared_output = self._run_shared_in_recv_windows(
+                hidden_states, topk_output
+            )
+        else:
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         if enable_npu_dual_stream:
             wait_share_stream()
@@ -833,6 +864,32 @@ class MiniMaxM3MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
+
+    def _run_shared_in_recv_windows(self, hidden_states, topk_output):
+        """Issue the shared projections between each DeepEP send and receive."""
+        gate_up = shared_output = None
+
+        def project_gate_up(_dispatcher):
+            nonlocal gate_up
+            gate_up, _ = self.shared_experts.gate_up_proj(hidden_states)
+
+        def project_down(_dispatcher):
+            nonlocal shared_output
+            shared_output = self.shared_experts.forward_down(gate_up)
+
+        dispatcher = self.experts.dispatcher
+        handles = dispatcher.register_deepep_combine_hook(project_down)
+        try:
+            handles.extend(dispatcher.register_deepep_dispatch_hook(project_gate_up))
+            routed = self.experts(hidden_states, topk_output)
+            if shared_output is None:
+                raise RuntimeError(
+                    "DeepEP did not complete the shared expert projections"
+                )
+        finally:
+            for handle in handles:
+                handle.remove()
+        return routed, shared_output
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
