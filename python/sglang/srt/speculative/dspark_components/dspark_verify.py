@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from typing import Optional
 
@@ -120,7 +121,6 @@ class TargetVerifyExecutor:
         block_verification: bool = False,
     ) -> None:
         self.target_worker = target_worker
-        # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
         self._target_is_dsv41 = (
             getattr(
                 target_worker.model_runner.model_config.hf_text_config,
@@ -128,6 +128,9 @@ class TargetVerifyExecutor:
                 None,
             )
             == "deepseek_v41"
+        )
+        self._needs_graph_length_bound = self._target_is_dsv41 or bool(
+            os.environ.get("M31_STAGE1_GRAPH_MAX_KV_LEN")
         )
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
@@ -324,7 +327,7 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
-        if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
+        if verify_input.live_seq_lens_cpu is None and self._needs_graph_length_bound:
             verify_input.candidate_max_seq_len_upper_bound = (
                 candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
             )

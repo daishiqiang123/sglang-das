@@ -170,6 +170,35 @@ def _force_local_pages(
     )
 
 
+@triton.jit
+def _pack_live_pages_kernel(
+    Table, Counts, Starts, Packed, STRIDE: tl.constexpr, TILE: tl.constexpr
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    count = tl.load(Counts + row)
+    start = tl.load(Starts + row)
+    page = tl.load(Table + row * STRIDE + col, mask=col < count, other=0)
+    tl.store(Packed + start + col, tl.maximum(page, 0), mask=col < count)
+
+
+def pack_live_stage1_pages(table, seq_lens, block_size):
+    # The graph reuses these addresses. Each replay packs only the live pages.
+    rows, stride = table.shape
+    if not hasattr(table, "_live_stage1"):
+        table._live_stage1 = (
+            torch.empty(rows, device=table.device, dtype=torch.int32),
+            torch.empty(rows * stride, device=table.device, dtype=torch.int32),
+        )
+    lengths, packed = table._live_stage1
+    lengths.copy_(seq_lens.reshape(-1))
+    counts = (lengths + block_size - 1) // block_size
+    starts = counts.cumsum(0, dtype=torch.int32) - counts
+    _pack_live_pages_kernel[(rows, triton.cdiv(stride, 128))](
+        table, counts, starts, packed, stride, 128
+    )
+
+
 def _run_flash_mla_indexer(
     *,
     q: torch.Tensor,
@@ -182,6 +211,7 @@ def _run_flash_mla_indexer(
     init_blocks: int,
     local_blocks: int,
     safe_pages: Optional[torch.Tensor] = None,
+    live_segments: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Run gfx938 FlashMLA MSA128 Stage-1 + Stage-2 exactly."""
     *_, stage1, stage2 = _load_flash_mla()
@@ -218,7 +248,18 @@ def _run_flash_mla_indexer(
     # decode CUDA graph.  k_end is the live, device-side exclusive bound, so
     # padded page-table entries are never visible to the score computation.
     fixed_k_len = max_pages * block_size
-    if safe_pages is None:
+    if live_segments is not None:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+        )
+
+        kv_lens, safe_pages = live_segments
+        variant = get_capture_attention_variant()
+        if variant and variant.startswith("msa_stage1_cap_"):
+            fixed_k_len = int(variant.rsplit("_", 1)[1])
+            max_pages = fixed_k_len // block_size
+            safe_pages = safe_pages[: len(q_lens) * max_pages]
+    elif safe_pages is None:
         safe_pages = page_table.clamp_min(0).reshape(-1).contiguous()
     elif (
         safe_pages.device != page_table.device
@@ -229,18 +270,18 @@ def _run_flash_mla_indexer(
             "FlashMLA MSA128 cached safe-page metadata does not match the "
             "current page table"
         )
-    # These CPU lengths describe fixed graph capacities, never live request
-    # lengths. The upstream Stage1 materializes them with capture-safe fills;
-    # k_end and page-table contents remain live device inputs on each replay.
+    if live_segments is None:
+        kv_lens = _cpu_i32((fixed_k_len,) * len(q_lens))
     k_end_i32 = k_end.to(torch.int32).contiguous()
     score = stage1(
         q,
         _paged_index_k(k_cache, block_size),
         _cpu_i32(q_lens),
-        _cpu_i32((fixed_k_len,) * len(q_lens)),
+        kv_lens,
         causal=True,
         kv_indices=safe_pages,
         k_end=k_end_i32,
+        **({"max_kv_len": fixed_k_len} if live_segments is not None else {}),
     )
     _force_local_pages(score, k_end_i32, block_size, local_blocks)
     # Stage-2 can force common prefix pages directly.  Local pages are
@@ -376,6 +417,7 @@ def flash_mla_sparse_decode_indexer(
         page_table=page_table,
         q_lens=q_lens,
         k_end=seq_lens,
+        live_segments=getattr(page_table, "_live_stage1", None),
         block_size=block_size,
         topk=topk,
         init_blocks=init_blocks,

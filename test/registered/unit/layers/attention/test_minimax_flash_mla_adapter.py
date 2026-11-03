@@ -112,3 +112,31 @@ def test_reject_old_stage1_decode_before_native_launch(monkeypatch):
     monkeypatch.setattr(ops, "flash_mla_stage1_graph_available", lambda: False)
     with pytest.raises(ops.FlashMLAGfx938UnavailableError, match="capture-safe"):
         ops.flash_mla_sparse_decode_indexer(None, None, None, None, 128, 16, 1, 1)
+
+
+def test_stage1_graph_limit_reserves_verify_width(monkeypatch):
+    from sglang.srt.layers.attention.graph_variants import (
+        create_msa_stage1_graph_variants,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    sparse = SimpleNamespace(
+        _flash_mla_live_segments=True,
+        use_flash_mla_gfx938_indexer=True,
+        block_size_k=128,
+        _flash_mla_nb_max=8194,
+    )
+    runner = SimpleNamespace(attn_backend=sparse, is_draft_worker=False)
+    monkeypatch.setenv("M31_STAGE1_GRAPH_MAX_KV_LEN", "148608")
+    variants = create_msa_stage1_graph_variants(runner, ForwardMode.TARGET_VERIFY, 8)
+    batch = SimpleNamespace(seq_lens_cpu=torch.tensor([148600]))
+    assert variants.select(batch) == "msa_stage1_cap_148608"
+    batch.seq_lens_cpu += 1
+    assert variants.select(batch) == "msa_stage1_full"
+    batch.seq_lens_cpu = None
+    assert variants.select(batch) == "msa_stage1_full"
+    batch.spec_info = SimpleNamespace(candidate_max_seq_len_upper_bound=148600)
+    assert variants.select(batch) == "msa_stage1_cap_148608"
+    assert create_msa_stage1_graph_variants(runner, ForwardMode.EXTEND, 0) is None
+    monkeypatch.delenv("M31_STAGE1_GRAPH_MAX_KV_LEN")
+    assert create_msa_stage1_graph_variants(runner, ForwardMode.DECODE, 0) is None

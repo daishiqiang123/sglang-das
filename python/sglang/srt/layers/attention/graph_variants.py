@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 from sglang.srt.utils import is_hcu
@@ -79,9 +80,8 @@ DSV41_CANDIDATE_FILTERED = "candidate_filtered"
 
 
 @dataclass(frozen=True)
-class Dsv41CandidateGraphVariants:
-    """Candidate-indexer graphs keyed by the batch's longest request; a variant
-    below its limit skips low-ratio scoring or candidate filtering."""
+class LengthBoundedGraphVariants:
+    """Select the smallest captured graph covering every request in the batch."""
 
     # (label, max_seq_len it serves), ascending; the last label is the fallback.
     graph_limits: tuple[tuple[str, int], ...]
@@ -105,12 +105,48 @@ class Dsv41CandidateGraphVariants:
             for variant, limit in self.graph_limits:
                 if max_seq_len <= limit:
                     return variant
-        return DSV41_CANDIDATE_FILTERED
+        return self.capture_labels[-1]
+
+
+def create_msa_stage1_graph_variants(
+    model_runner, capture_mode, verify_width: int
+) -> Optional[LengthBoundedGraphVariants]:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    configured = os.environ.get("M31_STAGE1_GRAPH_MAX_KV_LEN")
+    if not configured or model_runner.is_draft_worker:
+        return None
+    if capture_mode not in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+        return None
+    backend = model_runner.attn_backend
+    backend = getattr(backend, "decode_backend", backend)
+    sparse = getattr(backend, "sparse", backend)
+    if not (
+        getattr(sparse, "_flash_mla_live_segments", False)
+        and sparse.use_flash_mla_gfx938_indexer
+    ):
+        return None
+    cap = int(configured)
+    if cap <= 0 or cap % sparse.block_size_k:
+        raise ValueError(
+            "M31_STAGE1_GRAPH_MAX_KV_LEN must be a positive multiple of the index page size"
+        )
+    if cap >= sparse._flash_mla_nb_max * sparse.block_size_k:
+        return None
+    label = f"msa_stage1_cap_{cap}"
+    logger.info("Stage1 decode graphs: compact KV limit %d, full-context fallback", cap)
+    return LengthBoundedGraphVariants(
+        graph_limits=((label, cap),),
+        capture_labels=(label, "msa_stage1_full"),
+        verify_extra_tokens=(
+            verify_width if capture_mode == ForwardMode.TARGET_VERIFY else 0
+        ),
+    )
 
 
 def create_dsv41_candidate_graph_variants(
     model_runner, capture_forward_mode, captured_req_width: int = 0
-) -> Optional[Dsv41CandidateGraphVariants]:
+) -> Optional[LengthBoundedGraphVariants]:
     import torch
 
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -157,7 +193,7 @@ def create_dsv41_candidate_graph_variants(
         graph_limits,
         span,
     )
-    return Dsv41CandidateGraphVariants(
+    return LengthBoundedGraphVariants(
         graph_limits=tuple(graph_limits),
         capture_labels=tuple(v for v, _ in graph_limits) + (DSV41_CANDIDATE_FILTERED,),
         # The verify backend adds this width to committed CPU lengths.

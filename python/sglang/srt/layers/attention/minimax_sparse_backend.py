@@ -478,6 +478,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self._flash_mla_page_table = None
         self._flash_mla_page_tables: dict[tuple, torch.Tensor] = {}
+        self._flash_mla_live_segments = os.environ.get("MSA_STAGE1_KERNEL") == "v8"
         self._flash_mla_sched_meta: dict[tuple[int, int], object] = {}
         self._flash_mla_prefill_indices: dict[tuple, torch.Tensor] = {}
         self._flash_mla_decode_indices: dict[tuple, torch.Tensor] = {}
@@ -976,6 +977,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             seq_lens,
             self.block_size_k,
         )
+        if (
+            self._flash_mla_decode_current
+            and self.use_flash_mla_gfx938_indexer
+            and self._flash_mla_live_segments
+        ):
+            from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
+                pack_live_stage1_pages,
+            )
+
+            pack_live_stage1_pages(table, seq_lens, self.block_size_k)
         self._flash_mla_page_table = table
 
     def _get_flash_mla_sched_meta(
