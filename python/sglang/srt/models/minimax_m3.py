@@ -205,6 +205,13 @@ _use_minimax_router_gemv = _is_hcu and get_bool_env_var(
 _minimax_router_gemv_block_k = 1024
 _minimax_router_gemv_num_warps = 1
 _minimax_router_gemv_logged = False
+_lightop_router_logged = False
+_lightop_router = None
+if _use_minimax_router_gemv and get_bool_env_var("SGLANG_USE_LIGHTOP"):
+    try:
+        from lightop import _router_gemm as _lightop_router
+    except ImportError:
+        pass  # Older LightOp installations use the Triton path.
 if _use_minimax_router_gemv:
     from sglang.kernels.ops.moe.minimax_router_gemv import (
         can_use_minimax_router_gemv as _can_use_minimax_router_gemv,
@@ -812,7 +819,22 @@ class MiniMaxM3MoE(nn.Module):
             if _can_use_minimax_router_gemv is not None:
                 if _can_use_minimax_router_gemv(hidden_states, self.gate.weight):
                     assert _minimax_router_gemv is not None
-                    global _minimax_router_gemv_logged
+                    global _minimax_router_gemv_logged, _lightop_router_logged
+                    if (
+                        _lightop_router is not None
+                        and hidden_states.shape[0] == 64
+                        and hidden_states.device == self.gate.weight.device
+                        and hidden_states.storage_offset() % 8 == 0
+                        and self.gate.weight.storage_offset() % 8 == 0
+                        and torch.cuda.get_device_properties(hidden_states.device)
+                        .gcnArchName.split(":")[0] == "gfx938"
+                    ):
+                        if not _lightop_router_logged:
+                            logger.info(
+                                "MiniMax router selected LightOp BF16 split-K16 (M=64)"
+                            )
+                            _lightop_router_logged = True
+                        return _lightop_router.forward(hidden_states, self.gate.weight)
                     if not _minimax_router_gemv_logged:
                         logger.info(
                             "MiniMax router GEMV selected: M=%s, N=%s, K=%s, "
