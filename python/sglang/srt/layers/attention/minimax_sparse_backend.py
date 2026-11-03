@@ -368,6 +368,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.use_flash_mla_gfx938_decode = self.use_flash_mla_gfx938
         self.use_flash_mla_gfx938_indexer = self.use_flash_mla_gfx938
+        self.index_fp8_mode = os.environ.get("SGLANG_MINIMAX_INDEX_FP8", "off")
+        if self.index_fp8_mode not in ("off", "cache", "dot"):
+            raise ValueError("SGLANG_MINIMAX_INDEX_FP8 must be off, cache, or dot")
+        if self.index_fp8_mode != "off":
+            self.use_flash_mla_gfx938_indexer = False
         if self.use_flash_mla_gfx938:
             if self.is_npu:
                 raise RuntimeError(
@@ -2501,7 +2506,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
             if self.main_fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
-            if self.fp8_attn_gemm:
+            if self.fp8_attn_gemm or self.index_fp8_mode == "dot":
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
@@ -2625,7 +2630,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # reads the bf16 k/v) and the DP trim.
             if self.main_fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
-            if self.fp8_attn_gemm:
+            if self.fp8_attn_gemm or self.index_fp8_mode == "dot":
                 if idx_q is not None:
                     idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
@@ -3177,7 +3182,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # fp8 attn-GEMM: quantize q/idx_q after the KV store (reads bf16 k/v).
             if self.main_fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
-            if self.fp8_attn_gemm:
+            if self.fp8_attn_gemm or self.index_fp8_mode == "dot":
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
             # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.

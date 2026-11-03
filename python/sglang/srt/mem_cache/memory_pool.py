@@ -6732,6 +6732,8 @@ def get_minimax_sparse_index_dtype(
     *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
 ) -> torch.dtype:
     """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
+    if os.environ.get("SGLANG_MINIMAX_INDEX_FP8", "off") in ("cache", "dot"):
+        return torch.float8_e4m3fn
     # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
     if fp8_attn_gemm:
         return kv_cache_dtype
