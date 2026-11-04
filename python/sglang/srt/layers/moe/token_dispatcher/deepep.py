@@ -1496,6 +1496,18 @@ class DeepEPDispatcher(BaseDispatcher):
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
 
+    def register_deepep_normal_combine_hook(self, hook):
+        # The callback enqueues its own alternate-stream work before combine.
+        # This is not a low-latency receive hook.
+        if (
+            not self.deepep_mode.enable_normal()
+            or self._get_impl() is not self._normal_dispatcher
+        ):
+            raise ValueError("Normal combine hook requires DeepEP normal mode")
+        if self._deepep_combine_hooks is None:
+            self._deepep_combine_hooks = _DeepEPCombineHooks()
+        return self._deepep_combine_hooks.register_hook(hook)
+
     def register_deepep_combine_hook(self, hook):
         if (
             not self.deepep_mode.enable_low_latency()

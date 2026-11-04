@@ -1232,6 +1232,18 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             raise
         return handle_list
 
+    def register_deepep_normal_combine_hook(self, hook):
+        # Preserve wrapper registration and cleanup for normal-mode overlap.
+        handle_list = []
+        try:
+            for inner in self._inners:
+                handle_list.append(inner.register_deepep_normal_combine_hook(hook))
+        except Exception:
+            for handle in handle_list:
+                handle.remove()
+            raise
+        return handle_list
+
     def register_deepep_combine_hook(self, hook):
         # K3 SBO: mirror the dispatch hook without bypassing dispatcher wrappers.
         handle_list = []

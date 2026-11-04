@@ -493,6 +493,16 @@ class MiniMaxM3MLP(nn.Module):
         return x
 
 
+def _get_prefill_shared_overlap_method() -> str:
+    method = envs.SGLANG_MINIMAX_PREFILL_SHARED_OVERLAP_METHOD.get()
+    if method not in ("off", "stream", "split"):
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_SHARED_OVERLAP_METHOD must be "
+            f"off, stream, or split; got {method!r}"
+        )
+    return method
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
 
@@ -706,9 +716,10 @@ class MiniMaxM3MoE(nn.Module):
                 "MiniMax standard-EP TP-sharded shared-expert overlap enabled "
                 f"(HIP, EP={parallel.moe_ep_size}, full decode graph capture).",
             )
+        self.prefill_shared_overlap_method = _get_prefill_shared_overlap_method()
         self.enable_deepep_shared_expert_overlap = (
             _is_hcu
-            and envs.SGLANG_MINIMAX_PREFILL_SHARED_OVERLAP.get()
+            and self.prefill_shared_overlap_method != "off"
             and get_deepep_mode().enable_normal()
             and get_moe_a2a_backend().is_deepep()
             and parallel.moe_ep_size > 1
@@ -718,7 +729,7 @@ class MiniMaxM3MoE(nn.Module):
         )
         if self.enable_deepep_shared_expert_overlap:
             logger.info_once(
-                "MiniMax DeepEP prefill shared-expert stream overlap enabled "
+                f"MiniMax DeepEP prefill shared-expert {self.prefill_shared_overlap_method} overlap enabled "
                 f"(HIP, EP={parallel.moe_ep_size}).",
             )
         self.bf16_router_gemm = envs.SGLANG_OPT_USE_BF16_ROUTER_GEMM.get()
@@ -834,7 +845,12 @@ class MiniMaxM3MoE(nn.Module):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    if self.prefill_shared_overlap_method == "split":
+                        shared_gate_up, _ = self.shared_experts.gate_up_proj(
+                            hidden_states
+                        )
+                    else:
+                        shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
             if enable_npu_dual_stream:
                 # Overlap shared experts with router/experts on a separate stream.
@@ -876,6 +892,31 @@ class MiniMaxM3MoE(nn.Module):
             final_hidden_states, shared_output = self._run_shared_in_recv_windows(
                 hidden_states, topk_output
             )
+        elif (
+            overlap_shared
+            and self.prefill_shared_overlap_method == "split"
+            and hidden_states.shape[0] > 0
+        ):
+
+            def project_shared_down(_dispatcher):
+                nonlocal shared_output
+                # Start down on the side stream at the normal combine boundary.
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self.shared_experts.forward_down(shared_gate_up)
+
+            handles = self.experts.dispatcher.register_deepep_normal_combine_hook(
+                project_shared_down
+            )
+            try:
+                final_hidden_states = self.experts(hidden_states, topk_output)
+                if shared_output is None:
+                    raise RuntimeError(
+                        "DeepEP normal combine did not run the shared projection"
+                    )
+            finally:
+                for handle in handles:
+                    handle.remove()
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
 
@@ -928,8 +969,10 @@ class MiniMaxM3MoE(nn.Module):
                         and hidden_states.device == self.gate.weight.device
                         and hidden_states.storage_offset() % 8 == 0
                         and self.gate.weight.storage_offset() % 8 == 0
-                        and torch.cuda.get_device_properties(hidden_states.device)
-                        .gcnArchName.split(":")[0] == "gfx938"
+                        and torch.cuda.get_device_properties(
+                            hidden_states.device
+                        ).gcnArchName.split(":")[0]
+                        == "gfx938"
                     ):
                         if not _lightop_router_logged:
                             logger.info(
@@ -2181,7 +2224,7 @@ class MiniMaxM3Model(nn.Module):
         elif _is_hcu and (
             envs.SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP.get()
             or (
-                envs.SGLANG_MINIMAX_PREFILL_SHARED_OVERLAP.get()
+                _get_prefill_shared_overlap_method() != "off"
                 and get_moe_a2a_backend().is_deepep()
                 and get_deepep_mode().enable_normal()
             )
