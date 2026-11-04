@@ -493,18 +493,6 @@ class MiniMaxM3MLP(nn.Module):
         return x
 
 
-def _use_deepep_shared_overlap() -> bool:
-    option = envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP
-    if option.is_set():
-        return option.get()
-    return (
-        get_parallel().attn_cp_size == 8
-        and envs.SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP.get()
-        and get_moe_a2a_backend().is_deepep()
-        and get_deepep_mode().is_normal()
-    )
-
-
 class MiniMaxM3MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
 
@@ -603,7 +591,7 @@ class MiniMaxM3MoE(nn.Module):
 
         self.split_shared_experts = (
             _is_hcu
-            and envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP.get()
+            and envs.SGLANG_MINIMAX_DECODE_SHARED_OVERLAP.get()
             and get_moe_a2a_backend().is_deepep()
             and get_moe_runner_backend().is_deep_gemm()
             and get_deepep_mode().enable_low_latency()
@@ -613,6 +601,10 @@ class MiniMaxM3MoE(nn.Module):
             and not is_sbo_enabled()
             and not is_tbo_enabled()
         )
+        if self.split_shared_experts:
+            logger.info_once(
+                "MiniMax DeepEP decode shared-expert receive-window overlap enabled"
+            )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_physical_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -716,19 +708,17 @@ class MiniMaxM3MoE(nn.Module):
             )
         self.enable_deepep_shared_expert_overlap = (
             _is_hcu
-            and _use_deepep_shared_overlap()
+            and envs.SGLANG_MINIMAX_PREFILL_SHARED_OVERLAP.get()
+            and get_deepep_mode().enable_normal()
             and get_moe_a2a_backend().is_deepep()
             and parallel.moe_ep_size > 1
             and self.shared_experts is not None
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
         )
-        self.deepep_shared_overlap_prefill_only = (
-            not envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP.is_set()
-        )
         if self.enable_deepep_shared_expert_overlap:
             logger.info_once(
-                "MiniMax DeepEP replicated shared-expert overlap enabled "
+                "MiniMax DeepEP prefill shared-expert stream overlap enabled "
                 f"(HIP, EP={parallel.moe_ep_size}).",
             )
         self.bf16_router_gemm = envs.SGLANG_OPT_USE_BF16_ROUTER_GEMM.get()
@@ -826,13 +816,15 @@ class MiniMaxM3MoE(nn.Module):
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_decode()
         )
-        overlap_shared = self.enable_deepep_shared_expert_overlap and (
-            not self.deepep_shared_overlap_prefill_only
-            or forward_batch.forward_mode.is_extend_without_speculative()
+        overlap_shared = (
+            self.enable_deepep_shared_expert_overlap
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and get_deepep_mode().resolve(get_is_extend_in_batch()).is_normal()
         )
         split_shared = (
             self.split_shared_experts
             and hidden_states.shape[0] > 0
+            and not forward_batch.forward_mode.is_extend_without_speculative()
             and get_deepep_mode().resolve(get_is_extend_in_batch()).is_low_latency()
         )
         overlap_shared = overlap_shared and not split_shared
@@ -2188,7 +2180,11 @@ class MiniMaxM3Model(nn.Module):
             alt_stream = get_stream("alt")
         elif _is_hcu and (
             envs.SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP.get()
-            or _use_deepep_shared_overlap()
+            or (
+                envs.SGLANG_MINIMAX_PREFILL_SHARED_OVERLAP.get()
+                and get_moe_a2a_backend().is_deepep()
+                and get_deepep_mode().enable_normal()
+            )
         ):
             # A dedicated name avoids coupling the MoE graph dependencies to
             # unrelated cache/attention users of the legacy "alt" stream.

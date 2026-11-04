@@ -2153,9 +2153,10 @@ class Envs:
     # Standard EP keeps the shared MLP TP-sharded and overlaps that branch
     # with router/routed-expert work on a side stream.
     SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP = EnvBool(False)
-    # DeepEP uses a replicated TP1 shared expert; long-prefill configurations
-    # can overlap it with routed A2A/GEMMs when CU contention is favorable.
-    SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    # Prefill overlaps the replicated shared MLP on a separate stream.
+    SGLANG_MINIMAX_PREFILL_SHARED_OVERLAP = EnvBool(False)
+    # Decode places shared projections inside DeepEP low-latency receive windows.
+    SGLANG_MINIMAX_DECODE_SHARED_OVERLAP = EnvBool(False)
     # EAGLE3-only greedy draft path: reduce Top-1 immediately after each
     # rank-local LM-head GEMM and exchange candidates instead of full logits.
     SGLANG_OPT_USE_EAGLE3_LM_HEAD_TOP1 = EnvBool(False)
