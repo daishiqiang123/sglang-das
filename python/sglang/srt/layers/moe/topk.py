@@ -2757,7 +2757,9 @@ def _post_process_topk_ids(
                 if solver is None:
                     raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
                 probabilities = log2phy_prob
-                dispatch_map = getattr(solver, "static_dispatch_map", None)
+                dispatch_map = getattr(solver, "dispatch_map", None)
+                if dispatch_map is None:
+                    dispatch_map = getattr(solver, "static_dispatch_map", None)
                 if dispatch_map is not None:
                     from sglang.kernels.ops.lplb import cuda_solver
 
@@ -2820,7 +2822,9 @@ def _post_process_topk_ids(
             and not hip_deepep_postprocessed
             and not recorder_was_fused
         ):
-            dispatch_map = getattr(lplb_solver, "static_dispatch_map", None)
+            dispatch_map = getattr(lplb_solver, "dispatch_map", None)
+            if dispatch_map is None:
+                dispatch_map = getattr(lplb_solver, "static_dispatch_map", None)
             if log2phy_prob is not None and dispatch_map is not None:
                 from sglang.kernels.ops.lplb import cuda_solver
 

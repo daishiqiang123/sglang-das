@@ -2346,6 +2346,20 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    @staticmethod
+    def get_lplb_device_solver_factory():
+        """Use device replica balancing for the opt-in HCU MegaMoE path."""
+        mode = os.environ.get("SGLANG_MINIMAX_MOE_MODE", "")
+        if mode not in ("", "megamoe"):
+            raise ValueError("SGLANG_MINIMAX_MOE_MODE must be megamoe or unset")
+        if mode != "megamoe" or get_exec().moe.ep_dispatch_algorithm != "lp":
+            return None
+        if not _is_hcu or not get_moe_a2a_backend().is_megamoe():
+            raise ValueError("MiniMax device LPLB requires HCU MegaMoE")
+        from sglang.srt.eplb.lplb_hip_waterfill import DeviceWaterfill
+
+        return DeviceWaterfill
+
     @property
     def routed_experts_weights_of_layer(self):
         return self.model.routed_experts_weights_of_layer
