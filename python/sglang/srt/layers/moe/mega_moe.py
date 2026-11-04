@@ -364,6 +364,7 @@ def _get_mega_moe_symm_buffer(
     runtime: str = _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM,
     cuda_graph_max_tokens_per_rank: Optional[int] = None,
     quant_mode: str = "fp8",
+    activation: str = "swiglu",
 ) -> SymmBuffer:
     if _is_hcu and runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
         import megamoe
@@ -395,6 +396,7 @@ def _get_mega_moe_symm_buffer(
     with num_sms_ctx:
         key = (
             package_key,
+            activation,
             quant_mode,
             id(group),
             num_max_tokens_per_rank,
@@ -416,6 +418,18 @@ def _get_mega_moe_symm_buffer(
                 kwargs["cuda_graph_max_tokens_per_rank"] = (
                     cuda_graph_max_tokens_per_rank
                 )
+            # The HCU SwiGLU-OAI runtime packs only routed FP8 experts and
+            # takes neither a shared-expert count nor an MMA layout selector.
+            if activation == "swigluoai":
+                if not (
+                    _is_hcu
+                    and runtime == _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM
+                    and quant_mode == "fp8"
+                    and num_shared_experts == 0
+                ):
+                    raise ValueError("SwiGLU-OAI requires routed HCU FP8 MegaMoE experts")
+            else:
+                kwargs.update(num_shared_experts=num_shared_experts, mma_type=mma_type)
             buf = factory(
                 group,
                 num_experts,
@@ -423,9 +437,7 @@ def _get_mega_moe_symm_buffer(
                 num_topk,
                 hidden,
                 intermediate_hidden,
-                num_shared_experts=num_shared_experts,
-                mma_type=mma_type,
-                activation="swiglu",
+                activation=activation,
                 **kwargs,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
@@ -682,6 +694,7 @@ def run_mega_routed_experts(
     num_shared_experts: int = 0,
     shared_l1_weights=None,
     shared_l2_weights=None,
+    activation: str = "swiglu",
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     from sglang.srt.runtime_context import get_parallel
@@ -738,6 +751,7 @@ def run_mega_routed_experts(
         num_shared_experts=num_shared_experts,
         mma_type=mma_type,
         runtime=runtime,
+        activation=activation,
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
         quant_mode=(
             "w4a8" if getattr(experts, "_mega_moe_hcu_w4a8_weights", False) else "fp8"

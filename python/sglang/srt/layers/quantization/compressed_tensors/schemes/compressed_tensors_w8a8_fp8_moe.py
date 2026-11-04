@@ -462,6 +462,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             )
 
             build_hcu_w8a8_mega_moe_experts_weights(layer)
+            # The static MiniMax route owns packed copies of both projections.
+            if getattr(layer.moe_runner_config, "is_minimax_m3", False):
+                layer._dsv4_w13_weight_shape = tuple(layer.w13_weight.shape)
+                layer._dsv4_w2_weight_shape = tuple(layer.w2_weight.shape)
+                del layer.w13_weight
+                del layer.w2_weight
             return
 
         if (

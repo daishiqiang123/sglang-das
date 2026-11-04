@@ -644,6 +644,23 @@ class MiniMaxM3MoE(nn.Module):
             **({"deepep_recv_hook": True} if self.split_shared_experts else {}),
         )
         self.experts.moe_runner_config.is_minimax_m3 = True
+        self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        if self.use_mega_moe:
+            from sglang.srt.layers.moe.mega_moe import get_hcu_mega_moe_runtime
+            from sglang.srt.runtime_context import get_server_args
+
+            if not _is_hcu or get_hcu_mega_moe_runtime() != "deep_gemm":
+                raise ValueError("MiniMax MegaMoE requires the HCU deep_gemm runtime")
+            if self.num_fused_shared_experts or parallel.moe_tp_size != 1:
+                raise ValueError(
+                    "MiniMax MegaMoE requires unfused shared experts and MoE TP1"
+                )
+            if get_server_args().enable_eplb:
+                raise ValueError(
+                    "MiniMax MegaMoE does not yet migrate packed experts with EPLB"
+                )
+            if abs(config.swiglu_alpha - 1.702) > 1e-6:
+                raise ValueError("MiniMax MegaMoE requires SwiGLU-OAI alpha 1.702")
         self.topk = TopK(
             top_k=(
                 config.num_experts_per_tok
@@ -665,7 +682,7 @@ class MiniMaxM3MoE(nn.Module):
             intermediate_size = config.intermediate_size * self.n_shared_experts
             # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
-            shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
+            shared_experts_tp1 = get_moe_a2a_backend().is_deepep() or self.use_mega_moe
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
@@ -743,7 +760,7 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or self.use_mega_moe:
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             return self.forward_normal(hidden_states)
@@ -847,7 +864,23 @@ class MiniMaxM3MoE(nn.Module):
 
         # DeepEP returns the complete per-token routed result (no TP all-reduce here);
         # shared experts are replicated (tp_size=1), so both add directly.
-        if split_shared:
+        if self.use_mega_moe:
+            from sglang.srt.layers.moe.mega_moe import run_mega_routed_experts
+
+            config = self.experts.moe_runner_config
+            final_hidden_states = run_mega_routed_experts(
+                self.experts,
+                hidden_states,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                hidden_size=hidden_states.shape[-1],
+                intermediate_size=config.intermediate_size_per_partition,
+                top_k=config.top_k,
+                num_tokens=hidden_states.shape[0],
+                activation_clamp=config.gemm1_clamp_limit,
+                activation="swigluoai",
+            )
+        elif split_shared:
             final_hidden_states, shared_output = self._run_shared_in_recv_windows(
                 hidden_states, topk_output
             )
