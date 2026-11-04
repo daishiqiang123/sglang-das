@@ -419,22 +419,43 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     torch.testing.assert_close(text_out, text_expected)
 
     def test_v41_megamoe_empty_rank_still_participates(self):
-        """An idle DP rank must reach A2A combine without running its router."""
-        moe = self._v41_moe(0, False)
+        """An idle DP rank joins routing collectives without running its gate."""
         hidden = torch.empty((0, 4))
 
         def run_experts(_experts, x, ids, weights, **kwargs):
             self.assertIsNone(ids)
             self.assertIsNone(weights)
-            # The collective boundary owns the result even on an idle rank.
             return x.new_empty((0, kwargs["hidden_size"]))
 
-        with patch.object(mega_moe, "run_mega_routed_experts", run_experts):
-            out = mega_moe._run_mega_routed(
-                moe, hidden, None, torch.empty(0, dtype=torch.long), num_tokens=0
-            )
-        self.assertEqual(out.shape, (0, 4))
-        moe.gate.assert_not_called()
+        for algorithm in ("static", "lp"):
+            with self.subTest(algorithm=algorithm):
+                moe = self._v41_moe(0, False)
+                moe.topk.empty_topk_output = MagicMock()
+                with (
+                    patch.object(mega_moe, "run_mega_routed_experts", run_experts),
+                    patch.object(
+                        mega_moe,
+                        "get_exec",
+                        return_value=SimpleNamespace(
+                            moe=SimpleNamespace(ep_dispatch_algorithm=algorithm)
+                        ),
+                    ),
+                ):
+                    out = mega_moe._run_mega_routed(
+                        moe,
+                        hidden,
+                        None,
+                        torch.empty(0, dtype=torch.long),
+                        num_tokens=0,
+                    )
+                self.assertEqual(out.shape, (0, 4))
+                moe.gate.assert_not_called()
+                if algorithm == "lp":
+                    moe.topk.empty_topk_output.assert_called_once_with(
+                        hidden.device, layer_id=moe.layer_id
+                    )
+                else:
+                    moe.topk.empty_topk_output.assert_not_called()
 
     @staticmethod
     def _v41_moe(fused_shared, scale_in_topk):

@@ -2678,6 +2678,7 @@ def _post_process_topk_ids(
     hip_deepep_postprocessed = False
     _fold_pad_weights_into_append = False
     log2phy_prob = None
+    lplb_solver = None
     dispatch_algorithm = (
         getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
         if expert_location_dispatch_info is not None
@@ -2756,11 +2757,12 @@ def _post_process_topk_ids(
                 if solver is None:
                     raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
                 probabilities = log2phy_prob
-                if hasattr(solver, "static_dispatch_map"):
+                dispatch_map = getattr(solver, "static_dispatch_map", None)
+                if dispatch_map is not None:
                     from sglang.kernels.ops.lplb import cuda_solver
 
                     topk_ids = cuda_solver.dispatch_probability(
-                        topk_ids, probabilities, solver.static_dispatch_map
+                        topk_ids, probabilities, dispatch_map
                     )
                 else:
                     topk_ids = topk_ids_logical_to_physical(
@@ -2818,7 +2820,17 @@ def _post_process_topk_ids(
             and not hip_deepep_postprocessed
             and not recorder_was_fused
         ):
-            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info, log2phy_prob)
+            dispatch_map = getattr(lplb_solver, "static_dispatch_map", None)
+            if log2phy_prob is not None and dispatch_map is not None:
+                from sglang.kernels.ops.lplb import cuda_solver
+
+                topk_ids = cuda_solver.dispatch_probability(
+                    topk_ids, log2phy_prob, dispatch_map
+                )
+            else:
+                topk_ids = topk_ids_logical_to_physical(
+                    topk_ids, remap_info, log2phy_prob
+                )
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a

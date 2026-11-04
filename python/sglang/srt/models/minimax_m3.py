@@ -515,6 +515,10 @@ class MiniMaxM3MoE(nn.Module):
             "w2_weight_deepgemm",
             "w13_weight_deepgemm_masked",
             "w2_weight_deepgemm_masked",
+            "mega_w13_weight",
+            "mega_w13_scale",
+            "mega_w2_weight",
+            "mega_w2_scale",
         }
         weights.extend(
             (name, tensor)
@@ -649,17 +653,12 @@ class MiniMaxM3MoE(nn.Module):
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
         if self.use_mega_moe:
             from sglang.srt.layers.moe.mega_moe import get_hcu_mega_moe_runtime
-            from sglang.srt.runtime_context import get_server_args
 
             if not _is_hcu or get_hcu_mega_moe_runtime() != "deep_gemm":
                 raise ValueError("MiniMax MegaMoE requires the HCU deep_gemm runtime")
             if self.num_fused_shared_experts or parallel.moe_tp_size != 1:
                 raise ValueError(
                     "MiniMax MegaMoE requires unfused shared experts and MoE TP1"
-                )
-            if get_server_args().enable_eplb:
-                raise ValueError(
-                    "MiniMax MegaMoE does not yet migrate packed experts with EPLB"
                 )
             if abs(config.swiglu_alpha - 1.702) > 1e-6:
                 raise ValueError("MiniMax MegaMoE requires SwiGLU-OAI alpha 1.702")
@@ -795,7 +794,9 @@ class MiniMaxM3MoE(nn.Module):
                 final_hidden_states = self._forward_router_experts(hidden_states)
         else:
             shared_output = None
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
@@ -868,7 +869,9 @@ class MiniMaxM3MoE(nn.Module):
                 ),
             )
         else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
 
         # DeepEP returns the complete per-token routed result (no TP all-reduce here);
         # shared experts are replicated (tp_size=1), so both add directly.

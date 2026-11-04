@@ -427,7 +427,9 @@ def _get_mega_moe_symm_buffer(
                     and quant_mode == "fp8"
                     and num_shared_experts == 0
                 ):
-                    raise ValueError("SwiGLU-OAI requires routed HCU FP8 MegaMoE experts")
+                    raise ValueError(
+                        "SwiGLU-OAI requires routed HCU FP8 MegaMoE experts"
+                    )
             else:
                 kwargs.update(num_shared_experts=num_shared_experts, mma_type=mma_type)
             buf = factory(
@@ -643,6 +645,9 @@ def _run_mega_routed(
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
+        # An empty rank still joins the per-layer LPLB count all-reduce.
+        if get_exec().moe.ep_dispatch_algorithm == "lp":
+            moe.topk.empty_topk_output(hidden_states.device, layer_id=moe.layer_id)
         topk_ids = None
         topk_weights = None
 
@@ -1290,11 +1295,21 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
 
         # Interleave both L1 gate/up weights and their channel scales before
         # Marlin w6 packing, exactly as in the operator team's FP8 demo.
-        experts.mega_l1_weights, experts.mega_l2_weights = (
-            deepgemm.mega.transform_weights_for_mega_moe(
-                (w13, w13_scale), (w2, w2_scale)
-            )
+        l1_pair, l2_pair = deepgemm.mega.transform_weights_for_mega_moe(
+            (w13, w13_scale), (w2, w2_scale)
         )
+        # EPLB migrates the tensors returned by the model's get_moe_weights.
+        # Keep packed weights visible and scales independent from source views,
+        # so migration cannot overwrite an alias twice in one exchange.
+        for name, tensor in (
+            ("mega_w13_weight", l1_pair[0]),
+            ("mega_w13_scale", l1_pair[1].clone()),
+            ("mega_w2_weight", l2_pair[0]),
+            ("mega_w2_scale", l2_pair[1].clone()),
+        ):
+            experts.register_buffer(name, tensor, persistent=False)
+        experts.mega_l1_weights = (experts.mega_w13_weight, experts.mega_w13_scale)
+        experts.mega_l2_weights = (experts.mega_w2_weight, experts.mega_w2_scale)
         experts._mega_moe_hcu_weight_layout = "marlin_w6_interleaved"
     else:
         if (num_experts, hidden, intermediate) != (32, 4096, 2048):

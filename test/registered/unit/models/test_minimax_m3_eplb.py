@@ -23,7 +23,9 @@ def test_minimax_m3_marks_its_runner_for_cached_weight_layouts(monkeypatch):
     parallel = SimpleNamespace(
         moe_ep_size=1, moe_tp_size=1, tp_size=1, moe_tp_rank=0, tp_rank=0
     )
-    backend = SimpleNamespace(is_none=lambda: True, is_deepep=lambda: False)
+    backend = SimpleNamespace(
+        is_none=lambda: True, is_deepep=lambda: False, is_megamoe=lambda: False
+    )
     monkeypatch.setattr(minimax_m3, "get_parallel", lambda: parallel)
     monkeypatch.setattr(minimax_m3, "get_moe_a2a_backend", lambda: backend)
     monkeypatch.setattr(
@@ -90,7 +92,7 @@ def test_standard_ep_router_applies_expert_location_dispatch():
 
 
 @pytest.mark.parametrize("fused_shared", [0, 1])
-@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("packed", ["none", "deepgemm", "megamoe"])
 def test_eplb_exports_live_routed_weights_and_packed_buffers(fused_shared, packed):
     class Experts(nn.Module):
         def __init__(self):
@@ -105,9 +107,17 @@ def test_eplb_exports_live_routed_weights_and_packed_buffers(fused_shared, packe
             self.global_weight = nn.Parameter(torch.ones(4, 2))
             self.global_weight._sglang_require_global_experts = True
             self.register_buffer("unrelated_buffer", torch.ones(4, 2))
-            if packed:
+            if packed == "deepgemm":
                 self.register_buffer("w13_weight_deepgemm", torch.ones(4, 3))
                 self.register_buffer("w2_weight_deepgemm_masked", torch.ones(4, 5))
+            elif packed == "megamoe":
+                for name in (
+                    "mega_w13_weight",
+                    "mega_w13_scale",
+                    "mega_w2_weight",
+                    "mega_w2_scale",
+                ):
+                    self.register_buffer(name, torch.ones(4, 3))
 
     moe = MiniMaxM3MoE.__new__(MiniMaxM3MoE)
     nn.Module.__init__(moe)
@@ -118,10 +128,20 @@ def test_eplb_exports_live_routed_weights_and_packed_buffers(fused_shared, packe
         moe.experts.w2_weight,
         moe.experts.w13_weight_scale,
     ]
-    if packed:
+    if packed == "deepgemm":
         expected += [
             moe.experts.w13_weight_deepgemm,
             moe.experts.w2_weight_deepgemm_masked,
+        ]
+    elif packed == "megamoe":
+        expected += [
+            getattr(moe.experts, name)
+            for name in (
+                "mega_w13_weight",
+                "mega_w13_scale",
+                "mega_w2_weight",
+                "mega_w2_scale",
+            )
         ]
     exported = moe.get_moe_weights()
     assert len(exported) == len(expected)

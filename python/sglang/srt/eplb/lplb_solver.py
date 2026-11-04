@@ -44,6 +44,10 @@ _LPLB_SUPPORTED_MODEL_ARCHS: frozenset[str] = frozenset(
         "MistralLarge3ForCausalLMEagle",
         "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
+        # MegaMoE empty ranks join the solver through empty_topk_output.
+        "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
     }
 )
 
