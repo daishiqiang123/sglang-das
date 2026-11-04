@@ -373,6 +373,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             raise ValueError("SGLANG_MINIMAX_INDEX_FP8 must be off, cache, or dot")
         if self.index_fp8_mode != "off":
             self.use_flash_mla_gfx938_indexer = False
+        self.use_flash_mla_gfx938_prefill_indexer = self.use_flash_mla_gfx938_indexer
         if self.use_flash_mla_gfx938:
             if self.is_npu:
                 raise RuntimeError(
@@ -380,7 +381,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
             from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
                 flash_mla_gfx938_available,
+                flash_mla_stage1_fp8_available,
             )
+
+            # Keep FP8/Triton on older wheels without native Q/K scale support.
+            if self.index_fp8_mode == "dot":
+                self.use_flash_mla_gfx938_prefill_indexer = (
+                    flash_mla_stage1_fp8_available()
+                )
+                if self.use_flash_mla_gfx938_prefill_indexer:
+                    logger.info("[MiniMaxSparse] native FP8 prefill Stage1 enabled")
 
             local_q_heads = (
                 runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -422,8 +432,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "local heads must be Q64/KV4 (attention TP1), got "
                     f"Q{local_q_heads}/KV{local_kv_heads}"
                 )
-            if self.use_flash_mla_gfx938_indexer:
-                if self.use_flash_mla_gfx938_decode:
+            if (
+                self.use_flash_mla_gfx938_indexer
+                or self.use_flash_mla_gfx938_prefill_indexer
+            ):
+                if (
+                    self.use_flash_mla_gfx938_indexer
+                    and self.use_flash_mla_gfx938_decode
+                ):
                     from .minimax_sparse_ops.flash_mla_gfx938 import (
                         flash_mla_stage1_graph_available,
                     )
@@ -1972,7 +1988,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ) -> SimpleNamespace:
         """Return forward-local prefix/K-end metadata for one ragged segment."""
         if not (
-            self.cache_flash_mla_prefill_metadata and self.use_flash_mla_gfx938_indexer
+            self.cache_flash_mla_prefill_metadata
+            and self.use_flash_mla_gfx938_prefill_indexer
         ):
             return SimpleNamespace(prefix_lens=seq_lens - q_lens, k_end=None)
 
@@ -2664,7 +2681,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 flash_mla_safe_pages = None
                 if (
                     self.cache_flash_mla_prefill_metadata
-                    and self.use_flash_mla_gfx938_indexer
+                    and self.use_flash_mla_gfx938_prefill_indexer
                 ):
                     if self._flash_mla_prefill_safe_pages is None:
                         self._flash_mla_prefill_safe_pages = (
@@ -2689,7 +2706,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     index_view = None
                     if (
                         self.cache_flash_mla_prefill_metadata
-                        and self.use_flash_mla_gfx938_indexer
+                        and self.use_flash_mla_gfx938_prefill_indexer
                     ):
                         view_key = ("index_page_view", int(segment_max_k))
                         index_view = self._flash_mla_prefill_index_meta.get(view_key)
@@ -2735,7 +2752,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         use_msa=self.use_msa,
                         use_flash_mla_gfx938=self.use_flash_mla_gfx938,
                         use_flash_mla_gfx938_indexer=(
-                            self.use_flash_mla_gfx938_indexer
+                            self.use_flash_mla_gfx938_prefill_indexer
                         ),
                         flash_mla_page_table=self._flash_mla_page_table,
                         flash_mla_indices_output=(

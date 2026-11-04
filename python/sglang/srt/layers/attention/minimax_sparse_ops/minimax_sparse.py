@@ -310,6 +310,7 @@ def minimax_sparse_prefill(
             local_blocks,
             flash_mla_prefill_k_end,
             index_safe_pages,
+            index_scales=(idx_q_scale, idx_k_scale),
         )
     else:
         if idx_q is None or idx_k_cache is None:

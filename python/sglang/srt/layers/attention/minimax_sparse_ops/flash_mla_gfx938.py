@@ -108,6 +108,18 @@ def flash_mla_stage1_graph_available() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def flash_mla_stage1_fp8_available() -> bool:
+    """Whether the loaded native Stage1 accepts FP8 Q/K with scalar scales."""
+    import inspect
+
+    try:
+        *_, stage1, _ = _load_flash_mla()
+        return {"q_scale", "k_scale"} <= inspect.signature(stage1).parameters.keys()
+    except (FlashMLAGfx938UnavailableError, TypeError, ValueError):
+        return False
+
+
 def _paged_index_k(k_cache: torch.Tensor, page_size: int) -> torch.Tensor:
     """Expose SGLang slot-major index K as FlashMLA Stage-1 paged K."""
     if k_cache.dim() != 3 or k_cache.shape[1:] != (1, 128):
@@ -212,12 +224,19 @@ def _run_flash_mla_indexer(
     local_blocks: int,
     safe_pages: Optional[torch.Tensor] = None,
     live_segments: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    index_scales: Optional[tuple[float, float]] = None,
 ) -> torch.Tensor:
     """Run gfx938 FlashMLA MSA128 Stage-1 + Stage-2 exactly."""
     *_, stage1, stage2 = _load_flash_mla()
-    if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
+    stage1_kwargs = {}
+    if q.dtype == k_cache.dtype == torch.float8_e4m3fn and index_scales is not None:
+        stage1_kwargs = {
+            name: _fp8_scale_tensor(unit_scale(scale), q.device)
+            for name, scale in zip(("q_scale", "k_scale"), index_scales)
+        }
+    elif q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
         raise FlashMLAGfx938UnavailableError(
-            "FlashMLA MSA128 indexer requires BF16 index Q/K"
+            "FlashMLA MSA128 indexer requires BF16 Q/K or FP8 E4M3FN Q/K with scales"
         )
     if q.shape[1:] != (4, 128):
         raise FlashMLAGfx938UnavailableError(
@@ -281,6 +300,7 @@ def _run_flash_mla_indexer(
         causal=True,
         kv_indices=safe_pages,
         k_end=k_end_i32,
+        **stage1_kwargs,
         **({"max_kv_len": fixed_k_len} if live_segments is not None else {}),
     )
     _force_local_pages(score, k_end_i32, block_size, local_blocks)
@@ -320,6 +340,7 @@ def flash_mla_sparse_prefill_indexer(
     local_blocks: int,
     k_end: Optional[torch.Tensor] = None,
     safe_pages: Optional[torch.Tensor] = None,
+    index_scales: Optional[tuple[float, float]] = None,
 ) -> torch.Tensor:
     q_lens = tuple(int(x) for x in q_lens_cpu)
     if k_end is None:
@@ -344,6 +365,7 @@ def flash_mla_sparse_prefill_indexer(
         init_blocks=init_blocks,
         local_blocks=local_blocks,
         safe_pages=safe_pages,
+        index_scales=index_scales,
     )
 
 
