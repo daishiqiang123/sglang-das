@@ -73,10 +73,6 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    @staticmethod
-    def get_lplb_device_solver_factory():
-        return MiniMaxM3SparseForCausalLM.get_lplb_device_solver_factory()
-
     def __init__(
         self,
         config,

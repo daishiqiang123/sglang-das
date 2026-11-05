@@ -111,18 +111,6 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     metadata = get_global_expert_location_metadata()
     if metadata is None:
         return
-    # Models may supply a device solver without changing the public LP default.
-    # Resolve the class before model loading; consult the same hook on rebalance.
-    solver_options = {}
-    if dispatch_algorithm == "lp":
-        from sglang.srt.model_loader.utils import get_model_architecture
-
-        model_cls, _ = get_model_architecture(model_config)
-        get_factory = getattr(model_cls, "get_lplb_device_solver_factory", None)
-        if get_factory is not None:
-            factory = get_factory()
-            if factory is not None:
-                solver_options["device_solver_factory"] = factory
     clear_global_lplb_solvers()
     ep_group = get_parallel().moe_ep_group
     static_mass = None
@@ -178,7 +166,6 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
             ),
             static_probabilities=static_probabilities,
             static_max_copies=static_max_copies,
-            **solver_options,
         )
         set_global_lplb_solver(lid, solver)
     logger.info(

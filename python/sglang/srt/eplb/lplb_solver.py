@@ -97,7 +97,6 @@ class LPLBSolver:
         logical_to_all_physical_map_num_valid=None,
         static_probabilities: Optional[torch.Tensor] = None,
         static_max_copies: Optional[int] = None,
-        device_solver_factory=None,
     ):
         """
         Args:
@@ -108,12 +107,7 @@ class LPLBSolver:
             logical_to_all_physical_map_num_valid: (num_logical_experts,) number of valid physical copies.
             static_probabilities: Optional precomputed replica weights for this layout.
             static_max_copies: Compact width retaining every valid replica.
-            device_solver_factory: Optional explicit device replica solver.
         """
-        if static_probabilities is not None and device_solver_factory is not None:
-            raise ValueError(
-                "Static probabilities and a device solver are mutually exclusive"
-            )
         self._static_probabilities = static_probabilities
         if static_probabilities is not None:
             if static_probabilities.shape != log2phy.shape:
@@ -216,20 +210,9 @@ class LPLBSolver:
         # real request. No-op when the fused backend is unavailable.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        # Alternative solvers are opt-in; preserve the public LP path by default.
-        self._device_solver = None
-        self.dispatch_map = None
-        if device_solver_factory is not None:
-            width = max(int((self.log2phy >= 0).sum(-1).max()), 1)
-            if bool((self.log2phy[:, width:] >= 0).any()):
-                raise ValueError("Compact LP table would drop valid replicas")
-            compact = self.log2phy[:, :width].contiguous()
-            self.dispatch_map = compact.to(torch.int32)
-            self._device_solver = device_solver_factory(phy2log, compact, num_gpus)
-        if self._device_solver is None:
-            from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
+        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
 
-            _ipm_warmup(nc, nv, num_iters=5, device=device)
+        _ipm_warmup(nc, nv, num_iters=5, device=device)
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
@@ -245,9 +228,7 @@ class LPLBSolver:
         self._t1 = torch.empty(self.num_single, dtype=torch.float32, device=device)
         self._x = torch.empty(nv, dtype=torch.float32, device=device)
         self._log2phy_prob = torch.empty(
-            log2phy.shape if self.dispatch_map is None else self.dispatch_map.shape,
-            dtype=torch.float32,
-            device=device,
+            log2phy.shape, dtype=torch.float32, device=device
         )
 
     def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -308,8 +289,6 @@ class LPLBSolver:
             prep_lp_inputs → solve_ipm → extract_log2phy_prob
         Raises if the JIT CUDA backend is unavailable.
         """
-        if self._device_solver is not None:
-            return self._device_solver.solve(global_counts, self._log2phy_prob)
         from sglang.kernels.ops.lplb import cuda_solver
 
         cuda_solver.prep_lp_inputs(
