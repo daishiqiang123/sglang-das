@@ -629,6 +629,7 @@ def minimax_sparse_decode(
     hisparse_swap_in_fn: Optional[Callable] = None,
     indexer_cp=None,
     packed_queries: int = 1,  # consecutive rows sharing one request (EAGLE verify)
+    is_verify: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     k_cache = _flatten_main_kv_cache(k_cache)
     v_cache = _flatten_main_kv_cache(v_cache)
@@ -698,6 +699,8 @@ def minimax_sparse_decode(
             init_blocks,
             local_blocks,
             verify_group_size=verify_group_size,
+            is_verify=is_verify,
+            index_scales=(idx_q_scale, idx_k_scale),
         )
         real_seq_lens = seq_lens
     else:

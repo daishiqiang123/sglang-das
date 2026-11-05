@@ -120,6 +120,20 @@ def flash_mla_stage1_fp8_available() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def flash_mla_stage1_phase_available() -> bool:
+    """Whether native Stage1 distinguishes prefill, decode, and target verify."""
+    import inspect
+
+    try:
+        *_, stage1, _ = _load_flash_mla()
+        return {"is_prefill", "is_decode", "is_verify"} <= inspect.signature(
+            stage1
+        ).parameters.keys()
+    except (FlashMLAGfx938UnavailableError, TypeError, ValueError):
+        return False
+
+
 def _paged_index_k(k_cache: torch.Tensor, page_size: int) -> torch.Tensor:
     """Expose SGLang slot-major index K as FlashMLA Stage-1 paged K."""
     if k_cache.dim() != 3 or k_cache.shape[1:] != (1, 128):
@@ -225,9 +239,12 @@ def _run_flash_mla_indexer(
     safe_pages: Optional[torch.Tensor] = None,
     live_segments: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     index_scales: Optional[tuple[float, float]] = None,
+    phase: str,
 ) -> torch.Tensor:
     """Run gfx938 FlashMLA MSA128 Stage-1 + Stage-2 exactly."""
     *_, stage1, stage2 = _load_flash_mla()
+    if phase not in ("prefill", "decode", "verify"):
+        raise ValueError(f"Invalid FlashMLA Stage1 phase: {phase}")
     stage1_kwargs = {}
     if q.dtype == k_cache.dtype == torch.float8_e4m3fn and index_scales is not None:
         stage1_kwargs = {
@@ -237,6 +254,14 @@ def _run_flash_mla_indexer(
     elif q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
         raise FlashMLAGfx938UnavailableError(
             "FlashMLA MSA128 indexer requires BF16 Q/K or FP8 E4M3FN Q/K with scales"
+        )
+    # Older wheels have no phase keywords; preserve their BF16 decode and
+    # FP8 prefill interfaces. Native FP8 decode is gated on phase support.
+    if flash_mla_stage1_phase_available():
+        stage1_kwargs.update(
+            is_prefill=phase == "prefill",
+            is_decode=phase == "decode",
+            is_verify=phase == "verify",
         )
     if q.shape[1:] != (4, 128):
         raise FlashMLAGfx938UnavailableError(
@@ -366,6 +391,7 @@ def flash_mla_sparse_prefill_indexer(
         local_blocks=local_blocks,
         safe_pages=safe_pages,
         index_scales=index_scales,
+        phase="prefill",
     )
 
 
@@ -420,6 +446,8 @@ def flash_mla_sparse_decode_indexer(
     init_blocks: int,
     local_blocks: int,
     verify_group_size: int = 1,
+    is_verify: bool = False,
+    index_scales: Optional[tuple[float, float]] = None,
 ) -> torch.Tensor:
     if not flash_mla_stage1_graph_available():
         raise FlashMLAGfx938UnavailableError(
@@ -440,6 +468,8 @@ def flash_mla_sparse_decode_indexer(
         q_lens=q_lens,
         k_end=seq_lens,
         live_segments=getattr(page_table, "_live_stage1", None),
+        phase="verify" if is_verify else "decode",
+        index_scales=index_scales,
         block_size=block_size,
         topk=topk,
         init_blocks=init_blocks,

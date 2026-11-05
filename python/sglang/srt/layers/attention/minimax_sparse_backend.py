@@ -382,6 +382,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
                 flash_mla_gfx938_available,
                 flash_mla_stage1_fp8_available,
+                flash_mla_stage1_phase_available,
             )
 
             # Keep FP8/Triton on older wheels without native Q/K scale support.
@@ -389,8 +390,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.use_flash_mla_gfx938_prefill_indexer = (
                     flash_mla_stage1_fp8_available()
                 )
+                self.use_flash_mla_gfx938_indexer = (
+                    self.use_flash_mla_gfx938_prefill_indexer
+                    and flash_mla_stage1_phase_available()
+                )
                 if self.use_flash_mla_gfx938_prefill_indexer:
-                    logger.info("[MiniMaxSparse] native FP8 prefill Stage1 enabled")
+                    logger.info(
+                        "[MiniMaxSparse] native FP8 Stage1: prefill=True, decode/verify=%s",
+                        self.use_flash_mla_gfx938_indexer,
+                    )
 
             local_q_heads = (
                 runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -2564,6 +2572,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 page_size=self.page_size,
                 use_msa=False,
                 use_flash_mla_gfx938=self._flash_mla_decode_current,
+                is_verify=forward_batch.forward_mode.is_target_verify(),
                 use_flash_mla_gfx938_indexer=(
                     self.use_flash_mla_gfx938_indexer and self._flash_mla_decode_current
                 ),
@@ -3263,6 +3272,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 page_size=self.page_size,
                 use_msa=self._use_msa_decode,
                 use_flash_mla_gfx938=self._flash_mla_decode_current,
+                is_verify=forward_batch.forward_mode.is_target_verify(),
                 use_flash_mla_gfx938_indexer=(
                     self.use_flash_mla_gfx938_indexer and self._flash_mla_decode_current
                 ),
