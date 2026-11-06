@@ -460,13 +460,15 @@ def m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
     masked_m: torch.Tensor,
     expected_m_per_group: int,
 ) -> torch.Tensor:
-    return m_grouped_w4a8_gemm_nt_masked_hipc(
+    # The backend writes d in place and may return overlap metadata.
+    m_grouped_w4a8_gemm_nt_masked_hipc(
         (a0, a1),
         (b0, b1),
         d,
         masked_m,
         expected_m_per_group,
     )
+    return d
 
 
 def m_grouped_w4a8_gemm_nt_masked_hipc_fake(
