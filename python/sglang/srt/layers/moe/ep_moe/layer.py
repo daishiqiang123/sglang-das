@@ -2331,6 +2331,9 @@ class DeepEPMoE(FusedMoE):
                 beta=self.moe_runner_config.gemm1_beta,
                 limit=self.moe_runner_config.gemm1_clamp_limit,
                 tokens_per_expert=masked_m,
+                # HIPC clamps tail loads/stores to valid_m; its consumer
+                # accepts untouched padding from the LightOp flat schedule.
+                allow_undefined_padding=_use_w4a8_masked_hipc,
             )
         elif self.moe_runner_config.activation == "situ":
             q_a2_all, q_a2_scale = torch.ops.sglang.fuse_situ_mul_quant_ep(

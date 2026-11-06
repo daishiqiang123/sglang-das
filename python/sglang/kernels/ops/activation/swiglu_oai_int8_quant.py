@@ -1,9 +1,14 @@
 """Split SwiGLU OAI with input-dtype rounding and dynamic INT8 quantization."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+
+
+_USE_LIGHTOP_INT8 = os.getenv("SGLANG_USE_LIGHTOP_OAI_INT8_QUANT", "0") == "1"
 
 
 @triton.jit
@@ -43,11 +48,20 @@ def _swiglu_oai_int8_quant_kernel(
     tl.store(S + row, scale)
 
 
-def swiglu_oai_int8_quant(input, alpha, beta=1.0, limit=None, tokens_per_expert=None):
+def swiglu_oai_int8_quant(
+    input,
+    alpha,
+    beta=1.0,
+    limit=None,
+    tokens_per_expert=None,
+    *,
+    allow_undefined_padding=False,
+):
     """Return signed INT8 [..,H] and FP32 per-token scales [..,1].
 
     Input uses split gate/up halves. Optional counts mask [experts,capacity,2H]
     tensors with counts in [0,capacity]; padding is zero with unit scale.
+    The explicitly opted-in HIPC caller may allow unspecified masked padding.
     """
     if input.ndim not in (2, 3) or input.shape[-1] % 2 or not input.is_contiguous():
         raise ValueError("Expected contiguous [tokens,2H] or [experts,tokens,2H]")
@@ -71,6 +85,25 @@ def swiglu_oai_int8_quant(input, alpha, beta=1.0, limit=None, tokens_per_expert=
             raise ValueError("Expert counts must be contiguous device int32 [experts]")
     if limit is not None and limit <= 0:
         raise ValueError("Clamp limit must be positive")
+    if _USE_LIGHTOP_INT8 and input.dtype == torch.bfloat16 and hidden <= 8192:
+        from lightop.activation.swiglu_oai_int8_quant import (
+            swiglu_oai_int8_quant_contiguous,
+            swiglu_oai_int8_quant_masked,
+            swiglu_oai_int8_quant_masked_flat,
+        )
+
+        if tokens_per_expert is not None:
+            fn = (
+                swiglu_oai_int8_quant_masked_flat
+                if allow_undefined_padding
+                else swiglu_oai_int8_quant_masked
+            )
+            return fn(input, tokens_per_expert, alpha=alpha, beta=beta, limit=limit)
+        shape = input.shape
+        q, s = swiglu_oai_int8_quant_contiguous(
+            input.reshape(-1, 2 * hidden), alpha=alpha, beta=beta, limit=limit
+        )
+        return q.view(*shape[:-1], hidden), s.view(*shape[:-1], 1)
     quant = torch.empty(
         (*input.shape[:-1], hidden), dtype=torch.int8, device=input.device
     )
