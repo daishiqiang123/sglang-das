@@ -5,12 +5,15 @@ normalization and SwiGLU-OAI.  It must not inherit the Qwen draft's RMS/SiLU
 defaults, even though the DSpark worker and context-injection protocol agree.
 """
 
-from copy import copy
 import logging
+from copy import copy
+from types import SimpleNamespace
 
+import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.rotary_embedding.base import _launch_rotary_embedding
 from sglang.srt.models.dflash import DFlashAttention, DFlashDecoderLayer
@@ -104,6 +107,61 @@ class MiniMaxDSparkAttention(DFlashAttention):
         self.use_table_qk_norm_rope = False
         # self.rotary_emb = get_rope(...) from DFlash uses the generic HIP path.
         self.rotary_emb = MiniMaxDSparkRotaryEmbedding(self.rotary_emb)
+
+    def kv_proj_only(self, hidden_states: torch.Tensor):
+        """Skip unused Q outputs when materializing channel-INT8 context KV."""
+        projection = self.qkv_proj
+        weight = getattr(projection, "weight", None)
+        if (
+            weight is None
+            or weight.dtype != torch.int8
+            or not is_hcu()
+            or not envs.SGLANG_MINIMAX_DSPARK_INT8_KV_ONLY.get()
+        ):
+            return super().kv_proj_only(hidden_states)
+
+        from compressed_tensors.quantization import QuantizationStrategy
+
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
+            CompressedTensorsW8A8Int8,
+        )
+
+        scheme = getattr(projection, "scheme", None)
+        output_size = self.q_size + 2 * self.kv_size
+        scales = getattr(projection, "weight_scale", None)
+        # Method 3 uses contiguous [N, K] on gfx936/gfx938. Other layouts,
+        # tensor scales, static inputs and other quantization schemes retain
+        # the generic path.
+        if not (
+            type(scheme) is CompressedTensorsW8A8Int8
+            and scheme.w8a8_strategy == 3
+            and scheme.strategy == QuantizationStrategy.CHANNEL
+            and not scheme.is_static_input_scheme
+            and scheme.input_symmetric
+            and tuple(weight.shape) == (output_size, self.hidden_size)
+            and weight.is_contiguous()
+            and scales is not None
+            and tuple(scales.shape) == (output_size, 1)
+            and scales.dtype == torch.float32
+        ):
+            return super().kv_proj_only(hidden_states)
+
+        # These are views of the current post-load parameters: no duplicate
+        # weights and no cached pointers that could outlive a weight update.
+        kv_rows = slice(self.q_size, output_size)
+        kv_projection = SimpleNamespace(
+            weight=weight[kv_rows], weight_scale=scales[kv_rows]
+        )
+        bias = getattr(projection, "bias", None)
+        kv = scheme.apply_weights(
+            kv_projection,
+            hidden_states,
+            bias=None if bias is None else bias[kv_rows],
+        )
+        k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+        if self.v_scale is not None:
+            v = v * self.v_scale
+        return k, v
 
 
 class MiniMaxDSparkDecoderLayer(DFlashDecoderLayer):

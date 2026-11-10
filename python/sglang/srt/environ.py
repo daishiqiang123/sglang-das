@@ -1611,6 +1611,8 @@ class Envs:
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     # Opt-in M3.1 DSpark draft GQA sliding-window grouped split-KV.
     SGLANG_MINIMAX_M31_DRAFT_SPLITKV = EnvBool(False)
+    # Channel-INT8 context projection may skip the unused Q output rows.
+    SGLANG_MINIMAX_DSPARK_INT8_KV_ONLY = EnvBool(False)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
     # ===================================================================
