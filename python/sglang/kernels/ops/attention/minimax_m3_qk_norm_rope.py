@@ -472,6 +472,9 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     eps: tl.constexpr,
     is_neox_style: tl.constexpr,
     BLOCK_HD: tl.constexpr,
+    FP8_CACHE: tl.constexpr,
+    CACHE_SLOTS: tl.constexpr,
+    INDEX_CACHE_SLOTS: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     head_program = tl.program_id(1)
@@ -500,11 +503,6 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
         is_q,
         q_ptr,
         tl.where(is_k, k_ptr, tl.where(is_idx_q, idx_q_ptr, idx_k_ptr)),
-    )
-    out_ptr = tl.where(
-        is_q,
-        q_out_ptr,
-        tl.where(is_k, k_out_ptr, tl.where(is_idx_q, idx_q_out_ptr, idx_k_out_ptr)),
     )
     weight_ptr = tl.where(
         is_q,
@@ -545,7 +543,7 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     var = tl.sum(x * x, axis=0) / head_dim
     rstd = tl.rsqrt(var + eps)
     normed = x * rstd * (1.0 + w)
-    normed = normed.to(q_out_ptr.dtype.element_ty).to(tl.float32)
+    normed = normed.to(q_ptr.dtype.element_ty).to(tl.float32)
 
     rotary_mask = cols < rotary_dim
     if is_neox_style:
@@ -571,7 +569,7 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
         other=0.0,
     ).to(tl.float32)
     partner_normed = x_partner * rstd * (1.0 + w_partner)
-    partner_normed = partner_normed.to(q_out_ptr.dtype.element_ty).to(tl.float32)
+    partner_normed = partner_normed.to(q_ptr.dtype.element_ty).to(tl.float32)
 
     pos = tl.load(positions_ptr + token_id).to(tl.int64)
     cos_sin_base = cos_sin_cache_ptr + pos * rotary_dim
@@ -583,40 +581,69 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     ).to(tl.float32)
     rotated = normed * cos + sign * partner_normed * sin
     out = tl.where(rotary_mask, rotated, normed)
-    out_typed = out.to(q_out_ptr.dtype.element_ty)
+    out_typed = out.to(q_ptr.dtype.element_ty)
 
-    base_out = out_ptr + token_id * out_heads * head_dim + head_id * head_dim
-    tl.store(base_out + cols, out_typed, mask=mask)
+    if FP8_CACHE:
+        if is_q | is_idx_q:
+            out_ptr = tl.where(is_q, q_out_ptr, idx_q_out_ptr)
+            base_out = out_ptr + token_id * out_heads * head_dim + head_id * head_dim
+            tl.store(base_out + cols, out_typed.to(out_ptr.dtype.element_ty), mask=mask)
+    else:
+        out_ptr = tl.where(
+            is_q,
+            q_out_ptr,
+            tl.where(is_k, k_out_ptr, tl.where(is_idx_q, idx_q_out_ptr, idx_k_out_ptr)),
+        )
+        base_out = out_ptr + token_id * out_heads * head_dim + head_id * head_dim
+        tl.store(base_out + cols, out_typed, mask=mask)
 
     loc = tl.load(loc_ptr + token_id)
+    is_idx_k = head_program == idx_k_program
+    if FP8_CACHE:
+        # Slot zero is reserved for graph padding. Avoid concurrent dummy writes.
+        write_kv = is_k & (loc > 0) & (loc < CACHE_SLOTS)
+        write_idx_k = is_idx_k & (loc > 0) & (loc < INDEX_CACHE_SLOTS)
+    else:
+        write_kv = is_k
+        write_idx_k = is_idx_k
     cache_k_base = (
         k_cache_ptr
         + loc * k_cache_stride_s
         + head_id * k_cache_stride_h
         + cols * k_cache_stride_d
     )
-    tl.store(cache_k_base, out_typed, mask=mask & is_k)
-
     v_base = v_ptr + token_id * v_stride_m + head_id * head_dim * v_stride_d
-    v_val = tl.load(v_base + cols * v_stride_d, mask=mask & is_k, other=0.0)
+    v_val = tl.load(v_base + cols * v_stride_d, mask=mask & write_kv, other=0.0)
     cache_v_base = (
         v_cache_ptr
         + loc * v_cache_stride_s
         + head_id * v_cache_stride_h
         + cols * v_cache_stride_d
     )
-    tl.store(cache_v_base, v_val, mask=mask & is_k)
+    if FP8_CACHE:
+        # Main KV saturates before conversion. Index K follows the plain cast.
+        main_k = tl.clamp(
+            out_typed.to(tl.float32), -448.0, 448.0, propagate_nan=tl.PropagateNan.ALL
+        )
+        main_v = tl.clamp(
+            v_val.to(tl.float32), -448.0, 448.0, propagate_nan=tl.PropagateNan.ALL
+        )
+        tl.store(
+            cache_k_base, main_k.to(k_cache_ptr.dtype.element_ty), mask=mask & write_kv
+        )
+        tl.store(
+            cache_v_base, main_v.to(v_cache_ptr.dtype.element_ty), mask=mask & write_kv
+        )
+        index_k = out_typed.to(idx_k_cache_ptr.dtype.element_ty)
+    else:
+        tl.store(cache_k_base, out_typed, mask=mask & write_kv)
+        tl.store(cache_v_base, v_val, mask=mask & write_kv)
+        index_k = out.to(idx_k_cache_ptr.dtype.element_ty)
 
-    is_idx_k = head_program == idx_k_program
     idx_cache_base = (
         idx_k_cache_ptr + loc * idx_k_cache_stride_s + cols * idx_k_cache_stride_d
     )
-    # cast fp32 straight to the cache dtype (fp8 on gfx95) to avoid rounding twice via bf16
-    tl.store(
-        idx_cache_base,
-        out.to(idx_k_cache_ptr.dtype.element_ty),
-        mask=mask & is_idx_k,
-    )
+    tl.store(idx_cache_base, index_k, mask=mask & write_idx_k)
 
 
 def sparse_qk_index_gemma_rmsnorm_rope_cache(
@@ -639,8 +666,14 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     head_dim: int,
     rotary_dim: int,
     is_neox_style: bool,
+    *,
+    fp8_cache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores."""
+    """Fuse norm/RoPE with main KV and index-K stores.
+
+    The FP8 path uses unit scales, returns FP8 queries and leaves the input
+    K tensors as placeholders. Attention must read the already-written cache.
+    """
     assert q.dim() == k.dim() == v.dim() == idx_q.dim() == idx_k.dim() == 2
     assert k_cache.dim() == v_cache.dim() == idx_k_cache.dim() == 3
     assert out_cache_loc.dim() == positions.dim() == 1
@@ -659,10 +692,16 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     assert k_cache.shape[1] == v_cache.shape[1] == k_heads
     assert idx_k_cache.shape[1] == 1
 
-    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-    idx_q_out = torch.empty(idx_q.shape, dtype=idx_q.dtype, device=idx_q.device)
-    idx_k_out = torch.empty(idx_k.shape, dtype=idx_k.dtype, device=idx_k.device)
+    if fp8_cache:
+        assert k_cache.dtype == v_cache.dtype == idx_k_cache.dtype == torch.float8_e4m3fn
+        q_out = torch.empty(q.shape, dtype=torch.float8_e4m3fn, device=q.device)
+        idx_q_out = torch.empty(idx_q.shape, dtype=torch.float8_e4m3fn, device=q.device)
+        k_out, idx_k_out = k, idx_k
+    else:
+        q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+        idx_q_out = torch.empty(idx_q.shape, dtype=idx_q.dtype, device=idx_q.device)
+        idx_k_out = torch.empty(idx_k.shape, dtype=idx_k.dtype, device=idx_k.device)
     block_hd = triton.next_power_of_2(head_dim)
 
     _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel[
@@ -714,6 +753,9 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         eps,
         is_neox_style,
         BLOCK_HD=block_hd,
+        FP8_CACHE=fp8_cache,
+        CACHE_SLOTS=k_cache.shape[0],
+        INDEX_CACHE_SLOTS=idx_k_cache.shape[0],
         num_warps=4,
     )
     return q_out, k_out, idx_q_out, idx_k_out

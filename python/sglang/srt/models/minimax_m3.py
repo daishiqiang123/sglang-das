@@ -123,6 +123,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hcu,
+    is_hcu_native_fp8_supported,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -1713,6 +1714,43 @@ class MiniMaxM3Attention(nn.Module):
         self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
         return q_out, k, v, idx_q_out, idx_k, idx_v
 
+    def _can_fuse_sparse_fp8_qk_cache(
+        self, forward_batch: ForwardBatch, q: torch.Tensor
+    ) -> bool:
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode() or mode.is_target_verify()):
+            return False
+        if (
+            q.dtype != torch.bfloat16
+            or not is_hcu_native_fp8_supported()
+            or not isinstance(forward_batch.out_cache_loc, torch.Tensor)
+            or forward_batch.out_cache_loc.dtype not in (torch.int32, torch.int64)
+            or os.environ.get("SGLANG_MINIMAX_KV_CALIBRATION_DIR")
+            or os.environ.get("SGLANG_USE_LIGHTOP_MINIMAX_QK_ROPE") == "1"
+        ):
+            return False
+        sparse = get_forward_context().attn_backend.sparse
+        kv_pool = sparse.kv_pool
+        attn = self.attn
+        return (
+            self.disable_index_value
+            and sparse.flash_mla_fp8_main_attn_gemm
+            and sparse.use_flash_mla_gfx938_indexer
+            and sparse.index_fp8_mode == "dot"
+            and sparse.hisparse_coordinator is None
+            and not kv_pool._enable_hisparse
+            and all(
+                scale in (None, 1.0)
+                for scale in (
+                    attn.q_scale_float,
+                    attn.k_scale_float,
+                    attn.v_scale_float,
+                    attn.idx_q_scale_float,
+                    attn.idx_k_scale_float,
+                )
+            )
+        )
+
     def _sparse_qk_index_norm_rope_cache(
         self,
         positions: torch.Tensor,
@@ -1725,11 +1763,14 @@ class MiniMaxM3Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
-        # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
-        # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
         main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
+        fp8_cache_fusion = (
+            main_kv_is_fp8
+            and envs.SGLANG_M3_OPTIMIZE_SPARSE_ATTN_PREP.get()
+            and self._can_fuse_sparse_fp8_qk_cache(forward_batch, q)
+        )
         can_use_cache_fusion = (
-            not main_kv_is_fp8
+            (not main_kv_is_fp8 or fp8_cache_fusion)
             # DCP translates virtual slots to local physical slots and masks
             # token ownership. The current fused norm/RoPE/cache-store kernel
             # accepts neither translation nor a mask, so let the sparse backend
@@ -1755,7 +1796,21 @@ class MiniMaxM3Attention(nn.Module):
             # buffers as [page, page_size, head, dim]. Let the attention backend
             # perform its normal cache store for those layouts instead of passing
             # incompatible strides to the fusion.
-            if k_cache.dim() == v_cache.dim() == idx_k_cache.dim() == 3:
+            if k_cache.dim() == v_cache.dim() == idx_k_cache.dim() == 3 and (
+                not fp8_cache_fusion
+                or (
+                    k_cache.dtype
+                    == v_cache.dtype
+                    == idx_k_cache.dtype
+                    == torch.float8_e4m3fn
+                    and k_cache.shape == v_cache.shape
+                    and k_cache.shape[1:] == (self.num_kv_heads, self.head_dim)
+                    and idx_k_cache.shape[1:] == (1, self.idx_head_dim)
+                    and forward_batch.out_cache_loc.is_contiguous()
+                    and positions.is_contiguous()
+                    and self.rotary_emb.cos_sin_cache.is_contiguous()
+                )
+            ):
                 q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
                     q,
                     k,
@@ -1776,6 +1831,7 @@ class MiniMaxM3Attention(nn.Module):
                     self.head_dim,
                     self.rotary_dim,
                     self.rotary_emb.is_neox_style,
+                    fp8_cache=fp8_cache_fusion,
                 )
                 self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
                 return q, k, idx_q, idx_k

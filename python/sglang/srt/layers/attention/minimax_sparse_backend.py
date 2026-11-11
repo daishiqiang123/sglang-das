@@ -536,6 +536,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "draft chain (--speculative-eagle-topk 1)."
                 )
         self._target_verify_meta_cache_enabled = not is_tbo_enabled()
+        self._reuse_target_verify_metadata = (
+            _is_hcu
+            and self._target_verify_meta_cache_enabled
+            and self.use_flash_mla_gfx938_decode
+            and self.use_flash_mla_gfx938_indexer
+            and self.hisparse_coordinator is None
+            and envs.SGLANG_M3_OPTIMIZE_SPARSE_ATTN_PREP.get()
+        )
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -740,6 +748,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 prefix_lens = torch.empty(bs, device=device, dtype=torch.long)
                 req_matrix = torch.empty((bs, ndt), device=device, dtype=torch.long)
                 seq_matrix = torch.empty_like(req_matrix)
+                k_end_i32 = (
+                    torch.empty(bs * ndt, device=device, dtype=torch.int32)
+                    if self._reuse_target_verify_metadata
+                    else None
+                )
             except RuntimeError:
                 try:
                     capturing = torch.cuda.is_current_stream_capturing()
@@ -755,6 +768,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 seq_matrix=seq_matrix,
                 per_query_req=req_matrix.reshape(-1),
                 per_query_seq_lens=seq_matrix.reshape(-1),
+                k_end_i32=k_end_i32,
             )
             self._target_verify_meta_cache[key] = meta
 
@@ -799,12 +813,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._flash_mla_page_table = None
         self._flash_mla_prefill_index_meta.clear()
         self._flash_mla_prefill_safe_pages = None
+        verify_meta = None
+        if self._reuse_target_verify_metadata and isinstance(forward_batch, ForwardBatch):
+            forward_batch.minimax_m3_target_verify_meta = None
         if (
             _is_hcu
             and forward_batch.forward_mode.is_target_verify()
             and self.speculative_num_draft_tokens
         ):
-            self._get_target_verify_meta(
+            verify_meta = self._get_target_verify_meta(
                 forward_batch, int(self.speculative_num_draft_tokens)
             )
         if self.is_npu:
@@ -853,7 +870,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 and self._flash_mla_decode_current
             ):
                 ndt = int(self.speculative_num_draft_tokens or 0)
-                verify_meta = self._get_target_verify_meta(forward_batch, ndt)
+                if not self._reuse_target_verify_metadata or verify_meta is None:
+                    verify_meta = self._get_target_verify_meta(forward_batch, ndt)
                 if verify_meta is None:
                     raise RuntimeError(
                         "gfx938 FlashMLA TARGET_VERIFY requires reusable packed "
@@ -866,6 +884,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices,
                     verify_meta.seq_matrix[:, -1],
                 )
+                if self._reuse_target_verify_metadata:
+                    # The captured model binds these buffers for this graph
+                    # bucket. Replay metadata prep updates them in place.
+                    verify_meta.k_end_i32.copy_(verify_meta.per_query_seq_lens)
+                    if isinstance(forward_batch, ForwardBatch):
+                        forward_batch.minimax_m3_target_verify_meta = verify_meta
             else:
                 self._prepare_flash_mla_page_table(
                     forward_batch.req_pool_indices,
@@ -2518,7 +2542,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 q = q[:logical_num_tokens]
                 idx_q = idx_q[:logical_num_tokens]
 
-            meta = self._get_target_verify_meta(forward_batch, ndt)
+            prepared = (
+                getattr(forward_batch, "minimax_m3_target_verify_meta", None)
+                if self._reuse_target_verify_metadata
+                else None
+            )
+            use_prepared = prepared is not None and prepared.seq_matrix.shape == (bs, ndt)
+            meta = (
+                prepared if use_prepared else self._get_target_verify_meta(forward_batch, ndt)
+            )
             if meta is None:
                 per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
                     ndt
@@ -2538,12 +2570,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
             else:
                 per_query_req = meta.per_query_req
-                per_query_seq_lens = meta.per_query_seq_lens
+                per_query_seq_lens = (
+                    meta.k_end_i32 if use_prepared else meta.per_query_seq_lens
+                )
 
-            if self.main_fp8_attn_gemm:
-                q = _quant_q_fp8(q, layer.q_scale_float)
-            if self.fp8_attn_gemm or self.index_fp8_mode == "dot":
-                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            if not (kv_cached_by_fusion and q.dtype == torch.float8_e4m3fn):
+                if self.main_fp8_attn_gemm:
+                    q = _quant_q_fp8(q, layer.q_scale_float)
+                if self.fp8_attn_gemm or self.index_fp8_mode == "dot":
+                    idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
                 minimax_sparse_decode,
@@ -3159,7 +3194,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        if not self._is_sparse_kv_cached_by_fusion(forward_batch, layer.layer_id):
+        kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
+            forward_batch, layer.layer_id
+        )
+        if not kv_cached_by_fusion:
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
                 forward_batch.out_cache_loc,
@@ -3216,11 +3254,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch,
             )
         else:
-            # fp8 attn-GEMM: quantize q/idx_q after the KV store (reads bf16 k/v).
-            if self.main_fp8_attn_gemm:
-                q = _quant_q_fp8(q, layer.q_scale_float)
-            if self.fp8_attn_gemm or self.index_fp8_mode == "dot":
-                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            # The fused cache writer can already produce FP8 Q and index Q.
+            if not (kv_cached_by_fusion and q.dtype == torch.float8_e4m3fn):
+                if self.main_fp8_attn_gemm:
+                    q = _quant_q_fp8(q, layer.q_scale_float)
+                if self.fp8_attn_gemm or self.index_fp8_mode == "dot":
+                    idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
             # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
