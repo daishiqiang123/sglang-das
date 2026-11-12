@@ -2061,7 +2061,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def _try_store_query_sharded_cp_fp8_kv(
         self, forward_batch, k, v, idx_k, idx_v, layer
     ):
-        """Opt-in mixed-byte reorder/store fusion; preserve all other pool paths."""
+        """Gather CP-local KV and scatter it into token-major cache pools."""
         if (
             not _is_hcu
             or os.environ.get("SGLANG_MINIMAX_CP_FP8_KV_EXCHANGE", "0") != "1"
@@ -2073,6 +2073,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         index = getattr(pool, "index_k_pool", None)
         loc = forward_batch.out_cache_loc
         scales = (layer.k_scale_float, layer.v_scale_float)
+        fp8_index = (
+            index is not None
+            and index.dtype == torch.float8_e4m3fn
+            and os.environ.get("SGLANG_MINIMAX_CP_TRITON_FP8_CACHE_SCATTER", "0") == "1"
+        )
+        index_dtype = torch.float8_e4m3fn if fp8_index else torch.bfloat16
         if (
             strategy is None
             or strategy.name != "zigzag"
@@ -2082,7 +2088,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             or idx_k is None
             or idx_v is not None
             or main.dtype != torch.float8_e4m3fn
-            or index.dtype != torch.bfloat16
+            or index.dtype != index_dtype
+            or (
+                fp8_index
+                and any(
+                    scale not in (None, 1.0)
+                    for scale in (*scales, layer.idx_k_scale_float)
+                )
+            )
             or getattr(pool, "_enable_hisparse", False)
             or any(x.dtype != torch.bfloat16 for x in (k, v, idx_k))
             or tuple(k.shape[1:]) != (4, 128)
@@ -2120,11 +2133,40 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ):
             return False
         if not (
-            kc.dtype == vc.dtype == torch.float8_e4m3fn and ikc.dtype == torch.bfloat16
+            kc.dtype == vc.dtype == torch.float8_e4m3fn and ikc.dtype == index_dtype
         ):
             return False
         if not all(x.stride(2) == 1 and x.stride(1) == 128 for x in (kc, vc, ikc)):
             return False
+        if fp8_index:
+            if not (
+                kc.shape[0] == vc.shape[0] == ikc.shape[0]
+                and all(x.is_cuda and x.device == k.device for x in (kc, vc, ikc))
+                and all(
+                    x.stride(0) >= x.shape[1] * 128 for x in (kc, vc, ikc)
+                )
+            ):
+                return False
+            from sglang.kernels.ops.kvcache.minimax_cp_fp8_cache_scatter import (
+                minimax_cp_fp8_cache_scatter,
+            )
+
+            packed, _, _ = self._pack_query_sharded_cp_kv_bf16(k, v, idx_k, None)
+            raw, reorder = strategy.gather_kv_cache_raw_reusable(packed, forward_batch)
+            minimax_cp_fp8_cache_scatter(
+                raw, reorder, loc, kc, vc, ikc,
+                k_scale=scales[0],
+                v_scale=scales[1],
+                index_k_scale=layer.idx_k_scale_float,
+            )
+            if not getattr(self, "_cp_triton_fp8_scatter_logged", False):
+                logger.info(
+                    "MiniMax CP Triton FP8 cache scatter selected: BF16 AllGather, "
+                    "FP8 main K/V and index K caches"
+                )
+                self._cp_triton_fp8_scatter_logged = True
+            return True
+
         caches = [x.view(x.shape[0], -1).view(torch.uint8) for x in (kc, vc, ikc)]
         if not all(
             x.device == k.device
@@ -2239,9 +2281,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     None,
                 )
 
+        packed, shapes, widths = self._pack_query_sharded_cp_kv_bf16(k, v, idx_k, idx_v)
+        # This result is consumed immediately by the current-stream KV stores,
+        # so MiniMax can opt into the explicitly ephemeral reusable workspace.
+        packed_full = strategy.gather_kv_cache_reusable(
+            packed, forward_batch, torch.cuda.current_stream()
+        )
+        return self._restore_query_sharded_cp_kv(
+            packed_full,
+            shapes,
+            widths,
+            has_idx_k=idx_k is not None,
+            has_idx_v=idx_v is not None,
+        )
+
+    def _pack_query_sharded_cp_kv_bf16(self, k, v, idx_k, idx_v):
+        """Pack CP-local KV into the reusable BF16 transport buffer."""
         if idx_v is not None and idx_k is None:
             raise RuntimeError("MiniMax index V cannot be materialized without index K")
-        has_idx_k = idx_k is not None
         parts = [k, v]
         if idx_k is not None:
             parts.append(idx_k)
@@ -2277,18 +2334,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # projection. The destination is a persistent workspace, so this does
         # not add an allocation to the layer hot path.
         torch.cat(flat_parts, dim=1, out=packed[:local_rows])
-        # This result is consumed immediately by the current-stream KV stores,
-        # so MiniMax can opt into the explicitly ephemeral reusable workspace.
-        packed_full = strategy.gather_kv_cache_reusable(
-            packed[:local_rows], forward_batch, torch.cuda.current_stream()
-        )
-        return self._restore_query_sharded_cp_kv(
-            packed_full,
-            shapes,
-            widths,
-            has_idx_k=has_idx_k,
-            has_idx_v=idx_v is not None,
-        )
+        return packed[:local_rows], shapes, widths
 
     def _restore_query_sharded_cp_kv(
         self,
