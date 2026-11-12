@@ -387,6 +387,7 @@ class DraftBlockProposer:
         device: str,
         target_model,
         sampling_info,
+        published_host_seq_lens=None,
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
@@ -403,6 +404,7 @@ class DraftBlockProposer:
             embed_module=embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
+            published_host_seq_lens=published_host_seq_lens,
         )
         draft_block_ids = fwd.draft_block_ids
 
@@ -500,6 +502,7 @@ class DraftBlockProposer:
         embed_module,
         draft_sampler=None,
         sampling_info=None,
+        published_host_seq_lens=None,
     ) -> DraftForwardResult:
         gamma = self.gamma
         query_token_num = self.query_token_num
@@ -530,6 +533,9 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+        if published_host_seq_lens is not None:
+            batch.seq_lens_cpu, batch.seq_lens_sum = published_host_seq_lens.resolve()
+            verify_window.kv_loc_plan.seq_lens_cpu = batch.seq_lens_cpu
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())

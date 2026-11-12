@@ -785,6 +785,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        published_host_seq_lens=None,
     ) -> GenerationBatchResult:
         if pp_proxy_tensors is None:
             pp_proxy_tensors = getattr(self, "_next_pp_proxy_tensors", None)
@@ -822,7 +823,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        return self._forward_decode(
+            batch, on_publish, grammar_barrier,
+            published_host_seq_lens=published_host_seq_lens,
+        )
 
     def _forward_lifecycle_only_prefill(
         self, *, batch: ScheduleBatch, on_publish, pp_proxy_tensors
@@ -1194,6 +1198,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish,
         grammar_barrier=None,
         coordination_plan=None,
+        published_host_seq_lens=None,
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -1258,7 +1263,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
             seq_lens_cpu=(
-                batch.seq_lens_cpu
+                None
+                if published_host_seq_lens is not None
+                else batch.seq_lens_cpu
                 if batch.seq_lens_cpu is not None
                 else draft_input.nxt_kv_lens_cpu
             ),
@@ -1289,6 +1296,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
+                published_host_seq_lens=published_host_seq_lens,
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block

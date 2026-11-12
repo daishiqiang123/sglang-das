@@ -5603,14 +5603,31 @@ class Scheduler(
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
-                if not gpu_only_lens:
+                defer_cpu_lens = (
+                    self.future_map.copy_seq_lens_at_publish
+                    and self._confidence_budget_prepare is None
+                    and self.disaggregation_mode == DisaggregationMode.NULL
+                    and not self.enable_hisparse
+                    and get_parallel().pp_size == 1
+                    and batch.forward_mode.is_decode()
+                    and not batch.is_extend_in_batch
+                    and batch.prefill_input_ids_cpu is None
+                    and batch.spec_info is not None
+                    and batch.spec_info.future_indices is not None
+                    and batch.req_pool_indices_cpu is not None
+                    and self.future_map.publish_ready is not None
+                )
+                if not gpu_only_lens and not defer_cpu_lens:
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
-                    if gpu_only_lens:
+                    published_host_seq_lens = None
+                    if defer_cpu_lens:
+                        published_host_seq_lens = self.future_map.defer_seq_lens_cpu(batch)
+                    elif gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
                         self.future_map.resolve_seq_lens_cpu(batch, stream_ordered=True)
@@ -5627,6 +5644,8 @@ class Scheduler(
                         # draft_extend) so schedule prep can overlap with draft_extend.
                         # Non-spec has no later work — scheduler publishes after return.
                         fwd_kwargs = {}
+                        if published_host_seq_lens is not None:
+                            fwd_kwargs["published_host_seq_lens"] = published_host_seq_lens
                         if not batch.spec_algorithm.is_none():
                             fwd_kwargs["on_publish"] = partial(
                                 self.future_map.publish, future_indices
@@ -5682,6 +5701,11 @@ class Scheduler(
                                 self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
+
+                    if published_host_seq_lens is not None:
+                        # _forward_isolation restored schedule-time fields.
+                        # Keep the exact lengths that this forward consumed.
+                        batch.seq_lens_cpu, batch.seq_lens_sum = published_host_seq_lens.value
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None

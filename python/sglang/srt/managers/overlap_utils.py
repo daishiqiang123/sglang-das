@@ -291,6 +291,20 @@ class ConfidenceRelay(msgspec.Struct):
         )
 
 
+@dataclass
+class PublishedHostSeqLens:
+    event: Any
+    buffer: torch.Tensor
+    indices: torch.Tensor
+    value: Optional[tuple[torch.Tensor, int]] = None
+
+    def resolve(self) -> tuple[torch.Tensor, int]:
+        self.event.synchronize()
+        seq_lens = self.buffer[self.indices]
+        self.value = seq_lens, int(seq_lens.sum())
+        return self.value
+
+
 class FutureMap:
     """Always-on pool-indexed relay for cross-iter values. Forward writes via
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
@@ -331,18 +345,23 @@ class FutureMap:
             self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # CUDA reads lengths on a private D2H stream. HCU DSpark can
+        # populate the same host mirror before recording the publish event.
+        self.copy_seq_lens_at_publish = (
+            _is_hcu
+            and spec_algo.is_dspark()
+            and needs_cpu_seq_lens
+            and not needs_confidence_relay
+            and envs.SGLANG_HCU_ASYNC_SEQ_LENS_D2H.get()
+        )
+        self.new_seq_lens_cpu_pinned = None
+        if _is_cuda or self.copy_seq_lens_at_publish:
             self.new_seq_lens_cpu_pinned = torch.empty(
-                (self.req_pool_size,), dtype=torch.int64, pin_memory=True
+                (self.req_pool_size,), dtype=torch.int64, device="cpu", pin_memory=True
             )
-            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
-        else:
-            self.new_seq_lens_cpu_pinned = None
-            self.fwd_prepare_d2h_stream = None
+        self.fwd_prepare_d2h_stream = (
+            torch.get_device_module(self.device).Stream() if _is_cuda else None
+        )
         self.need_topk = False
         self.need_hidden_states = False
         self.topk_p_buf = None
@@ -561,7 +580,13 @@ class FutureMap:
         )
         batch.out_cache_loc = out_cache_loc
 
-        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+        if (
+            self.copy_seq_lens_at_publish
+            and self.publish_ready is not None
+            and batch.mix_running_indices_cpu is not None
+        ):
+            fresh_cpu = self.new_seq_lens_cpu_pinned[batch.mix_running_indices_cpu]
+        elif self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             fresh_cpu = fresh.cpu()  # bootstrap / non-CUDA
         else:
             self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
@@ -582,12 +607,26 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
+    def defer_seq_lens_cpu(self, batch: ScheduleBatch) -> PublishedHostSeqLens:
+        # The scheduler calls this on the forward stream after it waits on
+        # the schedule stream. The preceding publish is already ordered.
+        fi = batch.spec_info.future_indices
+        if _DEBUG_ASSERT:
+            assert self._publish_fresh, "resolve without a fresh forward publish"
+            self._publish_fresh = False
+        batch.seq_lens = self.new_seq_lens_buf[fi]
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+        return PublishedHostSeqLens(
+            self.publish_ready, self.new_seq_lens_cpu_pinned, batch.req_pool_indices_cpu
+        )
+
     def resolve_seq_lens_cpu(
         self, batch: ScheduleBatch, stream_ordered: bool = False
     ) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
-        # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        # opt out take the GPU-only path below.
         draft_input = batch.spec_info
         if draft_input is None:
             return
@@ -627,26 +666,26 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
-        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+        if (
+            self.copy_seq_lens_at_publish
+            and self.publish_ready is not None
+            and not stream_ordered
+            and batch.req_pool_indices_cpu is not None
+        ):
+            # The HCU event synchronize above also fences the host mirror.
+            batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
+        elif self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            if _DEBUG_ASSERT:
-                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
-            return
-
-        # Mechanism: don't sync the schedule stream; gate a private stream on the
-        # publish event and copy into the static pinned buffer.
-        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
-            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
-        self.fwd_prepare_d2h_stream.synchronize()
-
-        # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
-        batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
+        else:
+            # Gate the private D2H stream on publish for the existing CUDA path.
+            self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+            with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
+                self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
+            self.fwd_prepare_d2h_stream.synchronize()
+            # fi and req_pool_indices address the same request pool slots.
+            batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         if _DEBUG_ASSERT:
-            # After the D2H copy completed (synchronize above), so the pinned
-            # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
 
     def publish(
@@ -662,7 +701,10 @@ class FutureMap:
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
-        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
+        # HCU writes the host mirror on the forward stream so the consumer's
+        # existing publish fence covers both the length scatter and the D2H.
+        if self.copy_seq_lens_at_publish:
+            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
         if self.spec_algo.is_some():
             if self.publish_ready is None:
                 self.publish_ready = torch.get_device_module(self.device).Event()
