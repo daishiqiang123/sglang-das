@@ -2147,7 +2147,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
             ):
                 return False
-            from sglang.kernels.ops.kvcache.minimax_cp_fp8_cache_scatter import (
+            from sglang.kernels.ops.kvcache.triton_store_cache import (
                 minimax_cp_fp8_cache_scatter,
             )
 
