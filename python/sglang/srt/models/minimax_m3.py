@@ -208,6 +208,9 @@ _use_minimax_aiter_fused_ar_rmsnorm = _is_hcu and get_bool_env_var(
 _use_minimax_router_gemv = _is_hcu and get_bool_env_var(
     "SGLANG_OPT_USE_MINIMAX_ROUTER_GEMV", default="false"
 )
+_split_minimax_router_m144 = _is_hcu and get_bool_env_var(
+    "M31_HISPARSE_SPLIT_ROUTER_M144", default="false"
+)
 _minimax_router_gemv_block_k = 1024
 _minimax_router_gemv_num_warps = 1
 _minimax_router_gemv_logged = False
@@ -1020,9 +1023,22 @@ class MiniMaxM3MoE(nn.Module):
                     out_dtype=torch.float32,
                     max_m=self.tiny_router_gemm_max_tokens,
                 )
-            return torch.mm(
-                hidden_states, self.gate.weight.t(), out_dtype=torch.float32
-            )
+            weight_t = self.gate.weight.t()
+            # The deployed gfx938 rocBLAS table has a much faster FP32-output
+            # solution for 128 rows. Split only the affected Verify shape.
+            if (
+                _split_minimax_router_m144
+                and hidden_states.shape == (144, 6144)
+                and self.gate.weight.shape == (128, 6144)
+            ):
+                return torch.cat(
+                    (
+                        torch.mm(hidden_states[:128], weight_t, out_dtype=torch.float32),
+                        torch.mm(hidden_states[128:], weight_t, out_dtype=torch.float32),
+                    ),
+                    dim=0,
+                )
+            return torch.mm(hidden_states, weight_t, out_dtype=torch.float32)
         router_logits, _ = self.gate(hidden_states.to(torch.float32))
         return router_logits
 
