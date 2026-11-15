@@ -3179,8 +3179,6 @@ class MHATokenToKVPool(KVCache):
             cache_v = cache_v.view(self.store_dtype)
 
         if _kv_layout_hcu_fa and not self.use_hnd:
-            from sglang.srt.model_executor.runner import get_is_capture_mode
-
             page_idxs = loc // self.page_size
             offsets = loc % self.page_size
             self.k_buffer[layer_id - self.start_layer][page_idxs, :, offsets, :] = (
@@ -6763,7 +6761,7 @@ class MiniMaxSparseKVPool(KVCache):
         index_kv_pool_cls=MHATokenToKVPool,
         index_k_pool_cls=MHATokenToKOnlyPool,
         enable_hisparse: bool = False,
-        host_to_device_ratio: int = 2,
+        host_to_device_ratio: float = 2,
     ):
         # Do not call super().__init__() — delegate to sub-pools instead.
         self.size = size
@@ -6782,7 +6780,11 @@ class MiniMaxSparseKVPool(KVCache):
         ]
 
         index_dtype = index_dtype if index_dtype is not None else dtype
-        index_pool_size = size * host_to_device_ratio if enable_hisparse else size
+        index_pool_size = (
+            int(size * host_to_device_ratio) // page_size * page_size
+            if enable_hisparse
+            else size
+        )
 
         # Split sparse layers by V policy: kv_sparse (index_kv_pool holds K+V) vs
         # k_only_sparse (index_k_pool holds only K; V is never read).

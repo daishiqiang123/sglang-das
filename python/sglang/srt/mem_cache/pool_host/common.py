@@ -175,11 +175,12 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 2 if is_hcu() else 0))
+            status = cudart.cudaHostRegister(ptr, size, 2 if is_hcu() else 0)
+            rc = int(status)
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
+                    f"{cudart.cudaGetErrorString(status)}) at offset={offset} size={size} "
                     f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
                     f"pinned and device transfers may silently return stale data."
                 )
@@ -204,14 +205,15 @@ def _cuda_host_unregister_ranges(
 ) -> list[tuple[int, int]]:
     failed_ranges = []
     for ptr, size in reversed(registered_ranges):
-        rc = int(cudart.cudaHostUnregister(ptr))
+        status = cudart.cudaHostUnregister(ptr)
+        rc = int(status)
         if rc != 0:
             failed_ranges.append((ptr, size))
             logger.warning(
                 "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
                 rc,
-                cudart.cudaGetErrorString(rc),
+                cudart.cudaGetErrorString(status),
                 ptr,
                 size,
             )
@@ -243,9 +245,9 @@ def _hip_runtime() -> ctypes.CDLL:
     )
 
     # Bind the copy torch loaded; dlopen by soname could load a second HIP runtime.
-    path = find_loaded_library("libamdhip64")
+    path = find_loaded_library("libamdhip64") or find_loaded_library("libgalaxyhip")
     if path is None:
-        raise RuntimeError("libamdhip64 is not loaded in this process")
+        raise RuntimeError("No loaded HIP runtime (libamdhip64 or libgalaxyhip)")
     lib = ctypes.CDLL(path)
     lib.hipHostMalloc.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),

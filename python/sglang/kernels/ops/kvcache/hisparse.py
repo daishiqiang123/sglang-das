@@ -482,6 +482,97 @@ def load_blocks_to_device_buffer_mha(
     )
 
 
+@cache_once
+def _jit_commit_mha_all_layers() -> Module:
+    return load_jit(
+        "hisparse_commit_mha",
+        256,
+        cuda_files=["kvcacheio/hisparse.cuh"],
+        cuda_wrappers=[("commit", "commit_mha_all_layers<256>")],
+    )
+
+
+def commit_mha_all_layers(
+    scratch: torch.Tensor,
+    host_locs: torch.Tensor,
+    accepted: torch.Tensor,
+    source_k: torch.Tensor,
+    source_v: torch.Tensor,
+    host_k: torch.Tensor,
+    host_v: torch.Tensor,
+    item_size_bytes: int,
+) -> None:
+    """Back up accepted verify tokens into contiguous layer-first host K/V."""
+    _jit_commit_mha_all_layers().commit(
+        scratch,
+        host_locs,
+        accepted,
+        source_k,
+        source_v,
+        host_k,
+        host_v,
+        item_size_bytes,
+    )
+
+
+@cache_once
+def _jit_swap_mha_pages_tiled(block_size: int, blocks_per_request: int) -> Module:
+    return load_jit(
+        "hisparse_swap_mha_pages",
+        block_size,
+        blocks_per_request,
+        cuda_files=["kvcacheio/hisparse.cuh"],
+        cuda_wrappers=[
+            ("swap", f"swap_mha_pages_tiled<{block_size}, {blocks_per_request}>")
+        ],
+    )
+
+
+def swap_mha_pages_tiled(
+    src_locs,
+    dst_locs,
+    counts,
+    real,
+    host_k,
+    host_v,
+    device_k,
+    device_v,
+    block_size: int,
+    blocks_per_request: int,
+) -> None:
+    """Swap MiniMax 64 KiB K pages and matching V pages from mapped host KV."""
+    _jit_swap_mha_pages_tiled(block_size, blocks_per_request).swap(
+        src_locs, dst_locs, counts, real, host_k, host_v, device_k, device_v
+    )
+
+
+def copy_cache_planned_mha(
+    src_locs: torch.Tensor,
+    dst_locs: torch.Tensor,
+    counts: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+    src_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_k: torch.Tensor,
+    dst_v: torch.Tensor,
+    item_size_bytes: int,
+) -> None:
+    """Copy packed MHA plans, in page or token units, between mapped pools."""
+    module = _jit_copy_planned_module(256, False, False, False)
+    module.copy_cache_planned(
+        src_locs,
+        dst_locs,
+        counts,
+        num_real_reqs,
+        src_k,
+        src_v,
+        dst_k,
+        dst_v,
+        128,
+        item_size_bytes,
+    )
+
+
 def copy_cache_planned_mla(
     *,
     miss_src: torch.Tensor,

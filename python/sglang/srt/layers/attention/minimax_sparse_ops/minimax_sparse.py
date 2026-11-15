@@ -630,6 +630,7 @@ def minimax_sparse_decode(
     indexer_cp=None,
     packed_queries: int = 1,  # consecutive rows sharing one request (EAGLE verify)
     is_verify: bool = False,
+    flash_mla_hot_indices_fn: Optional[Callable] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     k_cache = _flatten_main_kv_cache(k_cache)
     v_cache = _flatten_main_kv_cache(v_cache)
@@ -787,6 +788,11 @@ def minimax_sparse_decode(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 verify_group_size=verify_group_size,
+                hot_indices=(
+                    None
+                    if flash_mla_hot_indices_fn is None
+                    else flash_mla_hot_indices_fn(topk_idx, seq_lens)
+                ),
             )
         elif use_msa and sink is None and hisparse_slots is None:
             from .msa import MSAUnavailableError, msa_sparse_decode_main

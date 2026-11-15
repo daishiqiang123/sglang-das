@@ -1008,7 +1008,10 @@ class ModelRunner:
         self.init_ngram_embedding_manager()
         self.maybe_init_watermark_state()
 
-        self.maybe_init_hisparse_coordinator()
+        import os
+
+        if os.environ.get("M31_HISPARSE_DEFER_HOST_POOL") != "1":
+            self.maybe_init_hisparse_coordinator()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
@@ -1028,6 +1031,30 @@ class ModelRunner:
             resolve_shared_index_layers,
         )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        import os
+
+        if os.environ.get("M31_HISPARSE_EARLY_DEEPEP") == "1":
+            from sglang.srt.distributed.parallel_state import get_moe_ep_group
+            from sglang.srt.models.minimax_m3 import MiniMaxM3MoE
+
+            moe = next(
+                (
+                    layer
+                    for layer in self.model.modules()
+                    if isinstance(layer, MiniMaxM3MoE)
+                ),
+                None,
+            )
+            if moe is None:
+                raise RuntimeError(
+                    "Early DeepEP initialization requires a MiniMax MoE layer"
+                )
+            dispatcher = moe.experts.dispatcher._inners[0]
+            logger.info("Initializing MiniMax DeepEP before the HiSparse host pool")
+            dispatcher._low_latency_dispatcher._get_buffer()
+            torch.distributed.barrier(group=get_moe_ep_group().cpu_group)
+            logger.info("MiniMax DeepEP initialized before the HiSparse host pool")
 
         hisparse_cfg = parse_hisparse_config()
         hisparse_top_k = getattr(

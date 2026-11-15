@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _CUDA_HOST_REGISTERED_RANGES_ATTR,
     _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
@@ -119,6 +120,9 @@ def prepare_mha_write_back_staging(
 
 
 class MHATokenToKVPoolHost(HostKVCache):
+    _chunk_layer_first_registration = False
+    _uses_host_pointer_tables = True
+
     def __init__(
         self,
         buffer_info: MHABufferInfo,
@@ -252,7 +256,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self._transfer_device,
                 host_memory_registered=self.pin_memory,
             )
-            if self.k_data_refs
+            if self._uses_host_pointer_tables and self.k_data_refs
             else None
         )
         self.v_data_ptrs = (
@@ -261,7 +265,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self._transfer_device,
                 host_memory_registered=self.pin_memory,
             )
-            if self.v_data_refs
+            if self._uses_host_pointer_tables and self.v_data_refs
             else None
         )
         self.host_kv_data_refs = self.k_data_refs + self.v_data_refs
@@ -334,6 +338,8 @@ class MHATokenToKVPoolHost(HostKVCache):
                 if self.layout == "page_unified"
                 else self.page_size * self.layout_dim
                 if self.layout in ("page_first", "page_first_direct")
+                else self.size * self.token_stride_size
+                if self.layout == "layer_first" and self._chunk_layer_first_registration
                 else None
             ),
         )
@@ -1197,6 +1203,11 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
 class HiSparseMHATokenToKVPoolHost(HiSparseHostPoolMixin, MHATokenToKVPoolHost):
     """Layer-first MHA host pool with page-granular HiSparse allocation."""
 
+    # Keep each whole K/V layer inside one registration, including Mooncake copies.
+    _chunk_layer_first_registration = True
+    # HiSparse swaps use layer tensors directly, including for write-back.
+    _uses_host_pointer_tables = False
+
     def __init__(
         self,
         buffer_info: MHABufferInfo,
@@ -1217,6 +1228,20 @@ class HiSparseMHATokenToKVPoolHost(HiSparseHostPoolMixin, MHATokenToKVPoolHost):
             start_layer=start_layer,
             end_layer=end_layer,
         )
+
+    def commit_layer_ranges(self) -> list[tuple[int, int]]:
+        # Each K and V slice passed to a fused commit must use one HIP mapping.
+        ranges = getattr(self.kv_buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, ())
+        layer_bytes = self.k_data_refs[0].nbytes
+        base = self.kv_buffer.data_ptr()
+        cuts = {0, self.layer_num}
+        for ptr, _ in ranges[1:]:
+            layer, remainder = divmod(ptr - base, layer_bytes)
+            if remainder:
+                raise RuntimeError("HiSparse host registration splits a K/V layer")
+            cuts.add(layer % self.layer_num)
+        boundaries = sorted(cuts)
+        return list(zip(boundaries, boundaries[1:]))
 
     def get_contiguous_buf_infos(self):
         buffers = self.k_data_refs + self.v_data_refs

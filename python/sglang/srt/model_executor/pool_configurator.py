@@ -374,13 +374,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         int(draft_num_layers) * get_parallel().attn_dcp_size,
                         force_dense_dsa_indexer=True,
                     )
+                target_cell_size = self._cell_size
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=self._cell_size,
+                    target_cell_size_per_token=target_cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=draft_cell_size,
                 )
+                if (
+                    get_memory().enable_hisparse
+                    and is_minimax_sparse(kvc.model_config.hf_config)
+                    and envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938.get()
+                ):
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    # Draft uses the target allocator's full logical address
+                    # space even though target main KV uses the smaller hot pool.
+                    ratio = parse_hisparse_config().host_to_device_ratio
+                    self._cell_size += math.ceil(
+                        (self._cell_size - target_cell_size) * (ratio - 1)
+                    )
 
     def _compute_cell_size(
         self,
@@ -526,7 +540,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
             # cell_size is already a sum over heterogeneous sub-pools.
-            return main_pool_bytes + indexer_bytes * full_pool_ratio
+            return math.ceil(main_pool_bytes + indexer_bytes * full_pool_ratio)
         else:
             n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (

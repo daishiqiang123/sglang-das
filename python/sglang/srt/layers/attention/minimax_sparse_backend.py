@@ -124,6 +124,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.is_hip = is_hip()
         self.kv_pool = runner.token_to_kv_pool
         self.hisparse_coordinator = runner.hisparse_coordinator
+        self.m3_hisparse_verify = getattr(
+            self.hisparse_coordinator, "m3_flashmla_verify", None
+        )
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
         self.req_to_token = runner.req_to_token_pool.req_to_token
@@ -294,6 +297,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 local_tokens + self.block_size_k - 1
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
+        if (
+            self.m3_hisparse_verify is not None
+            and self.m3_hisparse_verify.compact_hot_buffer
+            and (
+                self.block_size_k != 128
+                or self.topk_blocks != 16
+                or self.init_blocks != 0
+                or self.local_blocks != 1
+            )
+        ):
+            raise ValueError(
+                "Compact MiniMax hot slots require FlashMLA Top16 with one forced local page"
+            )
         if self.hisparse_coordinator is not None:
             selected_tokens = self.topk_blocks * self.block_size_k
             assert selected_tokens <= self.hisparse_coordinator.device_buffer_size, (
@@ -405,9 +421,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
             local_kv_heads = self.kv_pool.main_pool.head_num
             contract_errors = []
-            if self.hisparse_coordinator is not None:
+            if (
+                self.hisparse_coordinator is not None
+                and self.m3_hisparse_verify is None
+            ):
                 contract_errors.append(
                     "HiSparse cannot use the full-KV FlashMLA backend"
+                )
+            if (
+                self.m3_hisparse_verify is not None
+                and not self.use_flash_mla_gfx938_indexer
+            ):
+                contract_errors.append(
+                    "MiniMax HiSparse requires the native FlashMLA decode indexer"
                 )
             if not flash_mla_gfx938_available():
                 contract_errors.append(
@@ -541,7 +567,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             and self._target_verify_meta_cache_enabled
             and self.use_flash_mla_gfx938_decode
             and self.use_flash_mla_gfx938_indexer
-            and self.hisparse_coordinator is None
+            and (
+                self.hisparse_coordinator is None
+                or (
+                    self.m3_hisparse_verify is not None
+                    and os.environ.get("M31_HISPARSE_REUSE_VERIFY_METADATA") == "1"
+                )
+            )
             and envs.SGLANG_M3_OPTIMIZE_SPARSE_ATTN_PREP.get()
         )
         _decode_cuda_graph = not check_cuda_graph_backend(
@@ -814,7 +846,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._flash_mla_prefill_index_meta.clear()
         self._flash_mla_prefill_safe_pages = None
         verify_meta = None
-        if self._reuse_target_verify_metadata and isinstance(forward_batch, ForwardBatch):
+        if self._reuse_target_verify_metadata and isinstance(
+            forward_batch, ForwardBatch
+        ):
             forward_batch.minimax_m3_target_verify_meta = None
         if (
             _is_hcu
@@ -2142,9 +2176,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             if not (
                 kc.shape[0] == vc.shape[0] == ikc.shape[0]
                 and all(x.is_cuda and x.device == k.device for x in (kc, vc, ikc))
-                and all(
-                    x.stride(0) >= x.shape[1] * 128 for x in (kc, vc, ikc)
-                )
+                and all(x.stride(0) >= x.shape[1] * 128 for x in (kc, vc, ikc))
             ):
                 return False
             from sglang.kernels.ops.kvcache.triton_store_cache import (
@@ -2154,7 +2186,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             packed, _, _ = self._pack_query_sharded_cp_kv_bf16(k, v, idx_k, None)
             raw, reorder = strategy.gather_kv_cache_raw_reusable(packed, forward_batch)
             minimax_cp_fp8_cache_scatter(
-                raw, reorder, loc, kc, vc, ikc,
+                raw,
+                reorder,
+                loc,
+                kc,
+                vc,
+                ikc,
                 k_scale=scales[0],
                 v_scale=scales[1],
                 index_k_scale=layer.idx_k_scale_float,
@@ -2441,7 +2478,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_v: Optional[torch.Tensor],
     ):
         if (
+            self.m3_hisparse_verify is not None
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            raise RuntimeError("MiniMax FlashMLA HiSparse requires target verify")
+        if (
             self.is_hip
+            and self.m3_hisparse_verify is None
             and (
                 not _is_hcu
                 or self.hisparse_coordinator is not None
@@ -2593,9 +2636,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 if self._reuse_target_verify_metadata
                 else None
             )
-            use_prepared = prepared is not None and prepared.seq_matrix.shape == (bs, ndt)
+            use_prepared = prepared is not None and prepared.seq_matrix.shape == (
+                bs,
+                ndt,
+            )
             meta = (
-                prepared if use_prepared else self._get_target_verify_meta(forward_batch, ndt)
+                prepared
+                if use_prepared
+                else self._get_target_verify_meta(forward_batch, ndt)
             )
             if meta is None:
                 per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
@@ -2682,6 +2730,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
                 verify_group_size=ndt,
+                flash_mla_hot_indices_fn=(
+                    None
+                    if self.m3_hisparse_verify is None
+                    else lambda topk, lengths: self.m3_hisparse_verify.swap(
+                        forward_batch.req_pool_indices,
+                        layer.layer_id,
+                        topk,
+                        lengths,
+                        indices_output=self._get_flash_mla_indices_output(
+                            logical_num_tokens,
+                            q.device,
+                            decode=True,
+                            verify_group_size=ndt,
+                        ),
+                    )
+                ),
             )
             o = o.reshape(logical_num_tokens, -1).contiguous()
             if idx_o is not None:
@@ -3239,6 +3303,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         **kwargs,
     ):
         assert len(kwargs) == 0
+        if self.m3_hisparse_verify is not None:
+            raise RuntimeError("MiniMax FlashMLA HiSparse requires target verify")
         disable_value = layer.layer_id in self.disable_value_layer_ids
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id

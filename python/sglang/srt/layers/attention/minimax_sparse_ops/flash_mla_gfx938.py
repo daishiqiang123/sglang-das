@@ -647,6 +647,7 @@ def flash_mla_sparse_decode_main(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     verify_group_size: int = 1,
+    hot_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run decode or target verify through the native multi-Q interface.
 
@@ -677,26 +678,38 @@ def flash_mla_sparse_decode_main(
             f"verify_group_size={verify_group_size}"
         )
     q_grouped = q.reshape(batch, verify_group_size, 64, 128)
-    blocks = (
-        topk_idx.permute(1, 0, 2)
-        .reshape(batch, verify_group_size, 4, 16)
-        .contiguous()
-        .to(torch.int32)
-    )
-    # Expand accepts one final KV length per request. Its causal rule then
-    # derives prefix+i from final_length-verify_width+i. Passing [B,S] here
-    # makes the native kernel read the first B flattened values instead.
-    grouped_seq_lens = (
-        seq_lens.reshape(batch, verify_group_size)[:, -1].to(torch.int32).contiguous()
-    )
-    indices = expand(
-        blocks,
-        causal=True,
-        seqused_k=grouped_seq_lens,
-        page_table=page_table,
-        output=indices_output,
-        s_q_axis=1,
-    )
+    if hot_indices is None:
+        blocks = (
+            topk_idx.permute(1, 0, 2)
+            .reshape(batch, verify_group_size, 4, 16)
+            .contiguous()
+            .to(torch.int32)
+        )
+        # Expand accepts one final KV length per request. Its causal rule then
+        # derives prefix+i from final_length-verify_width+i. Passing [B,S] here
+        # makes the native kernel read the first B flattened values instead.
+        grouped_seq_lens = (
+            seq_lens.reshape(batch, verify_group_size)[:, -1]
+            .to(torch.int32)
+            .contiguous()
+        )
+        indices = expand(
+            blocks,
+            causal=True,
+            seqused_k=grouped_seq_lens,
+            page_table=page_table,
+            output=indices_output,
+            s_q_axis=1,
+        )
+    else:
+        expected = (batch, verify_group_size, 4, 16 * block_size_k)
+        if hot_indices.shape != expected or hot_indices.dtype != torch.int32:
+            raise ValueError(f"FlashMLA HiSparse expects int32 hot indices {expected}")
+        if indices_output is not None and indices_output is not hot_indices:
+            indices_output.copy_(hot_indices)
+            indices = indices_output
+        else:
+            indices = hot_indices
     num_pages = k_cache.shape[0] // block_size_k
     k_paged = k_cache.view(num_pages, block_size_k, 4, 128)
     v_paged = v_cache.view(num_pages, block_size_k, 4, 128)

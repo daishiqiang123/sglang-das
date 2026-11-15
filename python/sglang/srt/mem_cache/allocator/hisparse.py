@@ -28,10 +28,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: torch.device,
         kvcache: HiSparseDSATokenToKVPool | MiniMaxSparseKVPool,
         need_sort: bool,
-        host_to_device_ratio: int = 2,
+        host_to_device_ratio: float = 2,
     ):
         self._kvcache = kvcache
-        self._size_full = size * host_to_device_ratio
+        self._size_full = int(size * host_to_device_ratio) // page_size * page_size
         self._size_hisparse = size
         self.compress_ratio = 1
         self.dtype = dtype

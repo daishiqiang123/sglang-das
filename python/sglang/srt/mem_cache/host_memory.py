@@ -133,9 +133,12 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
     return headroom
 
 
-def available_host_memory_bytes(*, allow_cgroup_fallback: bool = False) -> int:
+def available_host_memory_bytes(
+    *, allow_cgroup_fallback: bool = False, reclaimable_bytes: int = 0
+) -> int:
     """Allocatable RAM, counting reclaimable page cache as free."""
-    available = psutil.virtual_memory().available
+    memory = psutil.virtual_memory()
+    available = min(memory.total, memory.available + reclaimable_bytes)
     try:
         cgroup_headroom = _cgroup_memory_headroom()
     except (OSError, RuntimeError) as exc:

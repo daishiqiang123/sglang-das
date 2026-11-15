@@ -824,7 +824,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(
-            batch, on_publish, grammar_barrier,
+            batch,
+            on_publish,
+            grammar_barrier,
             published_host_seq_lens=published_host_seq_lens,
         )
 
@@ -1271,6 +1273,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
         )
 
+        coordinator = self.model_runner.hisparse_coordinator
+        hisparse_verify = (
+            None if coordinator is None else coordinator.m3_flashmla_verify
+        )
+        if hisparse_verify is not None:
+            hisparse_verify.prepare(batch, verify_window.verify_cache_loc)
+
         sampling_info = batch.sampling_info
         # Simulated acceptance overrides correct_len, so only the bonus token needs the
         # request's temperature: draft + accept run greedy, the bonus is still sampled.
@@ -1423,6 +1432,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
+        if hisparse_verify is not None:
+            hisparse_verify.commit(
+                batch.req_pool_indices,
+                prefix_lens,
+                verify_window.verify_cache_loc,
+                accept.commit_lens,
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,

@@ -1128,6 +1128,9 @@ class Scheduler(
                 req_to_token_pool=pool,
                 token_to_kv_pool_allocator=allocator,
             )
+        if os.environ.get("M31_HISPARSE_DEFER_HOST_POOL") == "1":
+            self.tp_worker.model_runner.maybe_init_hisparse_coordinator()
+        if self.draft_worker is not None:
             self.draft_worker.init_hicache_draft_plan()
 
     def init_all_attention_backends(self):
@@ -5626,7 +5629,9 @@ class Scheduler(
                     self.forward_stream.wait_stream(self.schedule_stream)
                     published_host_seq_lens = None
                     if defer_cpu_lens:
-                        published_host_seq_lens = self.future_map.defer_seq_lens_cpu(batch)
+                        published_host_seq_lens = self.future_map.defer_seq_lens_cpu(
+                            batch
+                        )
                     elif gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
@@ -5645,7 +5650,9 @@ class Scheduler(
                         # Non-spec has no later work — scheduler publishes after return.
                         fwd_kwargs = {}
                         if published_host_seq_lens is not None:
-                            fwd_kwargs["published_host_seq_lens"] = published_host_seq_lens
+                            fwd_kwargs["published_host_seq_lens"] = (
+                                published_host_seq_lens
+                            )
                         if not batch.spec_algorithm.is_none():
                             fwd_kwargs["on_publish"] = partial(
                                 self.future_map.publish, future_indices
@@ -5705,7 +5712,9 @@ class Scheduler(
                     if published_host_seq_lens is not None:
                         # _forward_isolation restored schedule-time fields.
                         # Keep the exact lengths that this forward consumed.
-                        batch.seq_lens_cpu, batch.seq_lens_sum = published_host_seq_lens.value
+                        batch.seq_lens_cpu, batch.seq_lens_sum = (
+                            published_host_seq_lens.value
+                        )
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None

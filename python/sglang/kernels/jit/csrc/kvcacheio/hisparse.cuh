@@ -167,6 +167,14 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
 }
 #endif
 
+__device__ __forceinline__ BallotMask ballot_mask(bool predicate) {
+#ifdef USE_ROCM
+  return __ballot(predicate);
+#else
+  return __ballot_sync(FULL_WARP_MASK, predicate);
+#endif
+}
+
 __device__ __forceinline__ int popc_mask(BallotMask mask) {
 #ifdef USE_ROCM
   return __popcll(mask);
@@ -546,8 +554,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int local_hit_offset = 0;
     int local_evict_offset = 0;
     if (has_valid_chunk) {
-      const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
-      const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
+      const BallotMask hit_mask = ballot_mask(is_hit);
+      const BallotMask evict_mask = ballot_mask(is_evictable);
       local_hit_offset = popc_mask(hit_mask & lanes_before);
       local_evict_offset = popc_mask(evict_mask & lanes_before);
       if (lane_id == 0) {
@@ -623,7 +631,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
 
     if (has_valid_chunk) {
-      const BallotMask miss_mask = __ballot_sync(FULL_WARP_MASK, is_miss);
+      const BallotMask miss_mask = ballot_mask(is_miss);
       local_miss_offset = popc_mask(miss_mask & lanes_before);
       const int warp_miss_count = popc_mask(miss_mask);
       if (lane_id == 0) {
@@ -972,10 +980,102 @@ void copy_cache_planned(
       static_cast<const int32_t*>(num_real_reqs.data_ptr()),
       host_cache_k_ptr,
       host_cache_v_ptr,
-      device_buffer_k.data_ptr(),
-      (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+      runtime::get_device_accessible_ptr(device_buffer_k),
+      (IsMLA || device_buffer_v.ndim() == 0) ? nullptr : runtime::get_device_accessible_ptr(device_buffer_v),
       plan_stride,
       item_size_bytes);
+}
+
+// Write the accepted prefix of each request from per-layer scratch into
+// the mapped layer-first host KV, using one launch for every model layer.
+template <int BLOCK_SIZE>
+__global__ void commit_mha_all_layers_kernel(
+    const int64_t* scratch, const int32_t* host_locs, const int32_t* accepted,
+    const uint64_t* source_k, const uint64_t* source_v,
+    char* host_k, char* host_v, int batch, int width, int blocks_per_layer,
+    int64_t host_layer_stride, int64_t item_size_bytes) {
+  constexpr int warps_per_block = BLOCK_SIZE / WARP_SIZE;
+  const int layer = blockIdx.x / blocks_per_layer;
+  const int item = (blockIdx.x % blocks_per_layer) * warps_per_block + threadIdx.x / WARP_SIZE;
+  if (item >= batch * width || item % width >= accepted[item / width]) return;
+  const int64_t dst = host_locs[item];
+  if (dst < 0) return;
+  copy_miss_item<false, false>(
+      threadIdx.x % WARP_SIZE, reinterpret_cast<const void*>(source_k[layer]),
+      reinterpret_cast<const void*>(source_v[layer]), host_k + layer * host_layer_stride,
+      host_v + layer * host_layer_stride, scratch[item], dst, item_size_bytes);
+}
+
+template <int BLOCK_SIZE>
+void commit_mha_all_layers(
+    tvm::ffi::TensorView scratch, tvm::ffi::TensorView host_locs,
+    tvm::ffi::TensorView accepted, tvm::ffi::TensorView source_k,
+    tvm::ffi::TensorView source_v, tvm::ffi::TensorView host_k,
+    tvm::ffi::TensorView host_v, int64_t item_size_bytes) {
+  using namespace host;
+  const int batch = scratch.size(0);
+  const int width = scratch.size(1);
+  if (batch == 0) return;
+  constexpr int warps_per_block = BLOCK_SIZE / WARP_SIZE;
+  const int blocks_per_layer = (batch * width + warps_per_block - 1) / warps_per_block;
+  const auto device = LaunchKernel::resolve_device(scratch.device());
+  LaunchKernel(source_k.size(0) * blocks_per_layer, BLOCK_SIZE, device)(
+      commit_mha_all_layers_kernel<BLOCK_SIZE>,
+      static_cast<const int64_t*>(scratch.data_ptr()),
+      static_cast<const int32_t*>(host_locs.data_ptr()),
+      static_cast<const int32_t*>(accepted.data_ptr()),
+      static_cast<const uint64_t*>(source_k.data_ptr()),
+      static_cast<const uint64_t*>(source_v.data_ptr()),
+      static_cast<char*>(runtime::get_device_accessible_ptr(host_k)),
+      static_cast<char*>(runtime::get_device_accessible_ptr(host_v)),
+      batch, width, blocks_per_layer, host_k.size(1) * item_size_bytes, item_size_bytes);
+}
+
+template <int BLOCK_SIZE, int BLOCKS_PER_REQUEST>
+__global__ void swap_mha_pages_tiled_kernel(
+    const int64_t* src_locs, const int32_t* dst_locs, const int32_t* counts,
+    const int32_t* real, const uint4* host_k, const uint4* host_v,
+    uint4* device_k, uint4* device_v, int64_t stride) {
+  constexpr int vectors_per_page = 65536 / sizeof(uint4);
+  const int request = blockIdx.x / BLOCKS_PER_REQUEST;
+  if (request >= real[0]) return;
+  const int count = counts[request];
+  for (int item = blockIdx.x % BLOCKS_PER_REQUEST; item < count; item += BLOCKS_PER_REQUEST) {
+    const int64_t offset = request * stride + item;
+    const int64_t src = src_locs[offset] * vectors_per_page;
+    const int64_t dst = int64_t(dst_locs[offset]) * vectors_per_page;
+    #pragma unroll 4
+    for (int i = threadIdx.x; i < vectors_per_page; i += BLOCK_SIZE) {
+      const uint4 k = host_k[src + i];
+      const uint4 v = host_v[src + i];
+      device_k[dst + i] = k;
+      device_v[dst + i] = v;
+    }
+  }
+}
+
+template <int BLOCK_SIZE, int BLOCKS_PER_REQUEST>
+void swap_mha_pages_tiled(
+    tvm::ffi::TensorView src_locs, tvm::ffi::TensorView dst_locs,
+    tvm::ffi::TensorView counts, tvm::ffi::TensorView real,
+    tvm::ffi::TensorView host_k, tvm::ffi::TensorView host_v,
+    tvm::ffi::TensorView device_k, tvm::ffi::TensorView device_v) {
+  using namespace host;
+  const auto stride = src_locs.strides()[0];
+  if (dst_locs.strides()[0] != stride) {
+    throw std::runtime_error("swap_mha_pages_tiled: source and destination plan strides differ");
+  }
+  const auto device = LaunchKernel::resolve_device(src_locs.device());
+  LaunchKernel(src_locs.size(0) * BLOCKS_PER_REQUEST, BLOCK_SIZE, device)(
+      swap_mha_pages_tiled_kernel<BLOCK_SIZE, BLOCKS_PER_REQUEST>,
+      static_cast<const int64_t*>(src_locs.data_ptr()),
+      static_cast<const int32_t*>(dst_locs.data_ptr()),
+      static_cast<const int32_t*>(counts.data_ptr()),
+      static_cast<const int32_t*>(real.data_ptr()),
+      static_cast<const uint4*>(runtime::get_device_accessible_ptr(host_k)),
+      static_cast<const uint4*>(runtime::get_device_accessible_ptr(host_v)),
+      static_cast<uint4*>(device_k.data_ptr()),
+      static_cast<uint4*>(device_v.data_ptr()), stride);
 }
 
 }  // namespace sglang

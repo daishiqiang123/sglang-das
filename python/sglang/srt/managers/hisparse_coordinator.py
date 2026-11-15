@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import weakref
+from contextlib import nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -565,6 +568,10 @@ class HiSparseCoordinator:
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
         self.is_m3_hisparse = isinstance(kvcache, MiniMaxSparseKVPool)
+        self.m3_flashmla_verify = None
+        use_m3_flashmla = (
+            self.is_m3_hisparse and envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938.get()
+        )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -591,23 +598,24 @@ class HiSparseCoordinator:
             )
             if self.is_m3_hisparse:
                 self.mem_pool_device = kvcache.main_pool
-                assert self.mem_pool_device.head_num == 1, (
-                    "MiniMax M3 HiSparse requires one KV head per TP rank, "
-                    f"got {self.mem_pool_device.head_num}. Increase the "
-                    "tensor-parallel size."
-                )
-                self.mem_pool_host = HiSparseMHATokenToKVPoolHost(
-                    buffer_info=self.mem_pool_device.get_device_pool_infos()[
-                        0
-                    ].buffer_info,
-                    device_capacity_tokens=self.mem_pool_device.size
-                    if self.mem_pool_device.host_capacity_tokens is None
-                    else self.mem_pool_device.host_capacity_tokens,
-                    start_layer=self.mem_pool_device.start_layer,
-                    end_layer=self.mem_pool_device.end_layer,
-                    host_to_device_ratio=host_to_device_ratio,
-                    page_size=self.mem_pool_device.page_size,
-                )
+                expected_heads = 4 if use_m3_flashmla else 1
+                if self.mem_pool_device.head_num != expected_heads:
+                    raise ValueError(
+                        f"MiniMax HiSparse requires {expected_heads} local KV heads "
+                        f"for this backend, got {self.mem_pool_device.head_num}."
+                    )
+                if use_m3_flashmla and (
+                    num_draft_tokens != 8
+                    or self.mem_pool_device.page_size != 128
+                    or self.mem_pool_device.head_dim != 128
+                    or self.mem_pool_device.v_head_dim != 128
+                    or kvcache.dense_pool is not None
+                    or kvcache.index_kv_pool is not None
+                ):
+                    raise ValueError(
+                        "MiniMax FlashMLA HiSparse requires MSA128 verify8 "
+                        "with K-only indexers on all layers"
+                    )
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
                 self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
@@ -671,20 +679,24 @@ class HiSparseCoordinator:
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
+        token_metadata_width = 0 if use_m3_flashmla else self.padded_buffer_size
         self.req_device_buffer_tokens = torch.full(
-            (layer_num, max_num_req_slots, self.padded_buffer_size),
+            (layer_num, max_num_req_slots, token_metadata_width),
             -1,
             dtype=torch.int32,
             device=device,
         )
         self.req_device_buffer_token_locs = torch.full(
-            (layer_num, max_num_req_slots, self.padded_buffer_size),
+            (layer_num, max_num_req_slots, token_metadata_width),
             -1,
             dtype=torch.int32,
             device=device,
         )
+        # The MSA adapter keeps page labels and does not use token-level LRU.
         self._lru_init = torch.arange(
-            self.device_buffer_size, dtype=torch.int16, device=device
+            0 if use_m3_flashmla else self.device_buffer_size,
+            dtype=torch.int16,
+            device=device,
         )
         self.lru_slots = (
             self._lru_init.view(1, 1, -1)
@@ -693,22 +705,34 @@ class HiSparseCoordinator:
         )
         self.spec_swap = HiSparseSpecSwapManager(
             self,
-            num_draft_tokens=num_draft_tokens,
+            num_draft_tokens=0 if use_m3_flashmla else num_draft_tokens,
         )
+        if use_m3_flashmla:
+            from sglang.srt.layers.attention.minimax_sparse_ops.minimax_hisparse import (
+                MiniMaxHiSparseVerify,
+            )
+
+            self.m3_flashmla_verify = MiniMaxHiSparseVerify(
+                self, max_num_req_slots, layer_num
+            )
         if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
             self.token_to_kv_pool_allocator.configure_spec_scratch(
                 self.spec_swap.scratch_capacity,
                 device_buffer_size=self.padded_buffer_size,
             )
         self._device_buffer_arange_i32 = torch.arange(
-            self.device_buffer_size, dtype=torch.int32, device=device
+            0 if use_m3_flashmla else self.device_buffer_size,
+            dtype=torch.int32,
+            device=device,
         )
 
         # Pre-allocated output buffer for swap-in (CUDA-graph safe). MiniMax
         # selects blocks, so its flattened token-slot output can occupy any
         # prefix up to the full device working-set size.
         swap_output_width = (
-            self.device_buffer_size if self.is_m3_hisparse else self.top_k
+            0
+            if use_m3_flashmla
+            else (self.device_buffer_size if self.is_m3_hisparse else self.top_k)
         )
         self.top_k_device_locs_buffer = torch.full(
             (max_num_req_slots, swap_output_width),
@@ -732,6 +756,74 @@ class HiSparseCoordinator:
             layer_num=layer_num,
             max_num_req_slots=max_num_req_slots,
         )
+
+        if self.is_m3_hisparse:
+            device_module.synchronize()
+            self._init_minimax_host_pool(host_to_device_ratio, use_m3_flashmla)
+        if self.m3_flashmla_verify is not None:
+            self.m3_flashmla_verify.bind_host_commit_buffers()
+
+    def _init_minimax_host_pool(
+        self, host_to_device_ratio: float, use_m3_flashmla: bool
+    ) -> None:
+        # Reserve GPU metadata before registering the large host pool.
+        budget_scope = nullcontext()
+        if (
+            use_m3_flashmla
+            and os.environ.get("M31_HISPARSE_HOST_BUDGET_SNAPSHOT") == "1"
+        ):
+            from sglang.srt.distributed.parallel_state import get_moe_ep_group
+            from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
+            from sglang.srt.mem_cache.pool_host.base import (
+                HICACHE_HOST_MEMORY_RESERVE_BYTES,
+                host_memory_budget_scope,
+            )
+
+            if get_parallel().nnodes != 1:
+                raise ValueError("The MiniMax host-budget snapshot is single-node only")
+            cached_pages = 0
+            try:
+                lines = (
+                    Path("/sys/kernel/debug/hyttm/page_pool").read_text().splitlines()
+                )
+                total = next(line for line in lines if line.startswith("total"))
+                cached_pages = int(total.partition(":")[2].split()[0])
+            except (OSError, StopIteration, ValueError, IndexError):
+                pass
+            reclaimable = cached_pages * os.sysconf("SC_PAGE_SIZE")
+            free = available_host_memory_bytes(reclaimable_bytes=reclaimable)
+            group = get_moe_ep_group().cpu_group
+            budget = torch.tensor([free], dtype=torch.int64, device="cpu")
+            torch.distributed.all_reduce(
+                budget, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+            per_rank = (
+                int(budget.item()) - HICACHE_HOST_MEMORY_RESERVE_BYTES
+            ) // group.size()
+            logger.info(
+                "MiniMax HiSparse host snapshot: %.2f GB/rank; local TTM cache %.2f GB",
+                per_rank / 1e9,
+                reclaimable / 1e9,
+            )
+            budget_scope = host_memory_budget_scope(per_rank)
+        with budget_scope:
+            self.mem_pool_host = HiSparseMHATokenToKVPoolHost(
+                buffer_info=self.mem_pool_device.get_device_pool_infos()[0].buffer_info,
+                device_capacity_tokens=self.mem_pool_device.size
+                if self.mem_pool_device.host_capacity_tokens is None
+                else self.mem_pool_device.host_capacity_tokens,
+                start_layer=self.mem_pool_device.start_layer,
+                end_layer=self.mem_pool_device.end_layer,
+                host_to_device_ratio=host_to_device_ratio,
+                page_size=self.mem_pool_device.page_size,
+            )
+        self.mem_pool_host.pin_slot_indices = (
+            os.environ.get("M31_HISPARSE_PIN_SLOT_INDICES") == "1"
+        )
+        # Fake PD never initializes the handoff KV. Seed a known,
+        # finite host cache for the isolated capacity validation.
+        if os.environ.get("M31_HISPARSE_FAKE_VALIDATE") == "1":
+            self.mem_pool_host.kv_buffer.zero_()
 
     def _init_shared_index_prefetch(
         self,
@@ -887,7 +979,9 @@ class HiSparseCoordinator:
         self.alloc_device_buffer(req)
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
-        if host_len <= self.device_buffer_size:
+        if self.m3_flashmla_verify is not None:
+            self.m3_flashmla_verify.reset(req.kv.req_pool_idx)
+        elif host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
@@ -944,7 +1038,11 @@ class HiSparseCoordinator:
                 self.device_buffer_size,
             )
             # Spec verify needs the complete, graph-stable buffer even for short prompts.
-            if self.spec_swap.enabled or alloc_size == self.device_buffer_size:
+            if (
+                self.spec_swap.enabled
+                or self.m3_flashmla_verify is not None
+                or alloc_size == self.device_buffer_size
+            ):
                 alloc_size = self.padded_buffer_size
 
         compressed_logical_indices = (
@@ -971,12 +1069,13 @@ class HiSparseCoordinator:
         self.req_to_device_buffer[req.kv.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.kv.req_pool_idx] = alloc_size
 
-        self.req_device_buffer_tokens[
-            :, req.kv.req_pool_idx, : self.device_buffer_size
-        ] = self._device_buffer_arange_i32
-        self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
-            buffer_indices[:alloc_size]
-        )
+        if self.m3_flashmla_verify is None:
+            self.req_device_buffer_tokens[
+                :, req.kv.req_pool_idx, : self.device_buffer_size
+            ] = self._device_buffer_arange_i32
+            self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
+                buffer_indices[:alloc_size]
+            )
         self.spec_swap.allocate_scratch(req.kv.req_pool_idx)
         self.spec_swap.reset(req.kv.req_pool_idx)
 
@@ -1412,10 +1511,13 @@ class HiSparseCoordinator:
         # longer authoritative after the first rotation.
         current_cap = int(self.req_device_buffer_size[req_pool_idx])
         if current_cap > 0:
-            owned_locs = self.req_device_buffer_token_locs[
-                :, req_pool_idx, :current_cap
-            ].reshape(-1)
-            owned_locs = self.spec_swap.extend_owned_locs(req_pool_idx, owned_locs)
+            if self.m3_flashmla_verify is not None:
+                owned_locs = self.req_to_device_buffer[req_pool_idx, :current_cap]
+            else:
+                owned_locs = self.req_device_buffer_token_locs[
+                    :, req_pool_idx, :current_cap
+                ].reshape(-1)
+                owned_locs = self.spec_swap.extend_owned_locs(req_pool_idx, owned_locs)
             all_hi = torch.unique(owned_locs[owned_locs > 0])
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
@@ -1451,6 +1553,8 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
         self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
         self.spec_swap.clear_scratch(req_pool_idx)
+        if self.m3_flashmla_verify is not None:
+            self.m3_flashmla_verify.reset(req_pool_idx)
         self._skip_first_backup[req.kv.req_pool_idx] = False
 
     def _run_swap_in_kernel(

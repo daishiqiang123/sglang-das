@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
@@ -147,8 +149,63 @@ def validate_hisparse(server_args: ServerArgs) -> None:
             )
         return
 
-    # MiniMax M3 uses its own Triton sparse kernels.
     if is_m3_hisparse:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938.get():
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            from sglang.srt.utils import is_hcu
+
+            config = parse_hisparse_config(config_json=cfg.hisparse_config or "{}")
+            if not (
+                is_hcu()
+                and cfg.disaggregation_mode == "decode"
+                and (
+                    cfg.disaggregation_transfer_backend == "mooncake"
+                    or (
+                        cfg.disaggregation_transfer_backend == "fake"
+                        and os.environ.get("M31_HISPARSE_FAKE_VALIDATE") == "1"
+                    )
+                )
+                and cfg.pp_size == 1
+                and cfg.attn_cp_size == 1
+                and cfg.dcp_size == 1
+                and not cfg.enable_hierarchical_cache
+                and not cfg.disaggregation_decode_enable_radix_cache
+                and cfg.disaggregation_decode_host_receive_threshold == 1
+                and cfg.speculative_algorithm == "DSPARK"
+                and cfg.speculative_num_draft_tokens == 8
+                and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+                and cfg.page_size == 128
+            ):
+                raise ValueError(
+                    "MiniMax FlashMLA HiSparse requires HCU Mooncake PD decode, "
+                    "PP/CP/DCP=1, static DSpark verify8, page size 128, "
+                    "and no HiCache or decode radix cache."
+                )
+            size, ratio = config.device_buffer_size, config.host_to_device_ratio
+            compact = (
+                cfg.disaggregation_transfer_backend == "fake"
+                and os.environ.get("M31_HISPARSE_AB_COMPACT_HOT") == "1"
+            )
+            min_size = 61696 if compact else 65536
+            if (
+                type(size) is not int
+                or size < min_size
+                or size % 128
+                or type(ratio) not in (int, float)
+                or not math.isfinite(ratio)
+                or ratio < 1
+            ):
+                raise ValueError(
+                    "MiniMax FlashMLA HiSparse requires an aligned integer "
+                    f"device_buffer_size >= {min_size} and finite host_to_device_ratio >= 1."
+                )
         return
 
     if resolved_view(server_args).kv_cache_dtype not in (
