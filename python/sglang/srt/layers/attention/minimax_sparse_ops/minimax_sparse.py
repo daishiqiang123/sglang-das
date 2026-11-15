@@ -631,6 +631,7 @@ def minimax_sparse_decode(
     packed_queries: int = 1,  # consecutive rows sharing one request (EAGLE verify)
     is_verify: bool = False,
     flash_mla_hot_indices_fn: Optional[Callable] = None,
+    flash_mla_hisparse_query_chunk_size: int = 8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     k_cache = _flatten_main_kv_cache(k_cache)
     v_cache = _flatten_main_kv_cache(v_cache)
@@ -773,7 +774,7 @@ def minimax_sparse_decode(
                 )
             from .flash_mla_gfx938 import flash_mla_sparse_decode_main
 
-            o = flash_mla_sparse_decode_main(
+            kwargs = dict(
                 q=q,
                 k_cache=k_cache,
                 v_cache=v_cache,
@@ -788,12 +789,27 @@ def minimax_sparse_decode(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 verify_group_size=verify_group_size,
-                hot_indices=(
-                    None
-                    if flash_mla_hot_indices_fn is None
-                    else flash_mla_hot_indices_fn(topk_idx, seq_lens)
-                ),
             )
+            if (
+                flash_mla_hot_indices_fn is not None
+                and flash_mla_hisparse_query_chunk_size < verify_group_size
+            ):
+                from .minimax_hisparse import flash_mla_chunked_verify
+
+                o = flash_mla_chunked_verify(
+                    query_chunk_size=flash_mla_hisparse_query_chunk_size,
+                    hot_indices_fn=flash_mla_hot_indices_fn,
+                    **kwargs,
+                )
+            else:
+                o = flash_mla_sparse_decode_main(
+                    **kwargs,
+                    hot_indices=(
+                        None
+                        if flash_mla_hot_indices_fn is None
+                        else flash_mla_hot_indices_fn(topk_idx, seq_lens)
+                    ),
+                )
         elif use_msa and sink is None and hisparse_slots is None:
             from .msa import MSAUnavailableError, msa_sparse_decode_main
 

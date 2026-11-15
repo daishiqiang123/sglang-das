@@ -193,7 +193,12 @@ def validate_hisparse(server_args: ServerArgs) -> None:
                 cfg.disaggregation_transfer_backend == "fake"
                 and os.environ.get("M31_HISPARSE_AB_COMPACT_HOT") == "1"
             )
-            min_size = 61696 if compact else 65536
+            query_chunk = int(os.environ.get("M31_HISPARSE_VERIFY_QUERY_CHUNK", "8"))
+            if query_chunk not in (4, 8) or (query_chunk != 8 and not compact):
+                raise ValueError(
+                    "Split-query HiSparse requires the explicit fake-PD compact mode"
+                )
+            min_size = (query_chunk * 4 * 15 + 2) * 128 if compact else 65536
             if (
                 type(size) is not int
                 or size < min_size

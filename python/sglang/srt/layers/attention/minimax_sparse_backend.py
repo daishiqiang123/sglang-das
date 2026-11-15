@@ -2730,6 +2730,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
                 verify_group_size=ndt,
+                flash_mla_hisparse_query_chunk_size=(
+                    8
+                    if self.m3_hisparse_verify is None
+                    else self.m3_hisparse_verify.query_chunk_size
+                ),
                 flash_mla_hot_indices_fn=(
                     None
                     if self.m3_hisparse_verify is None

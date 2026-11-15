@@ -130,7 +130,12 @@ class MiniMaxHiSparseVerify:
         self.compact_hot_buffer = self.buffer_size < self.pages * self.page_size
         # Each query/head reserves one local page. A verify8 group spans at most
         # two local pages, leaving 8 * 4 * 15 other page selections.
-        min_pages = self.width * self.heads * (self.topk - 1) + 2
+        self.query_chunk_size = int(
+            os.environ.get("M31_HISPARSE_VERIFY_QUERY_CHUNK", "8")
+        )
+        if self.query_chunk_size not in (4, 8):
+            raise ValueError("MiniMax HiSparse verify query chunk must be 4 or 8")
+        min_pages = self.query_chunk_size * self.heads * (self.topk - 1) + 2
         if self.compact_hot_buffer and (
             os.environ.get("M31_HISPARSE_AB_COMPACT_HOT") != "1"
             or self.buffer_size < min_pages * self.page_size
@@ -387,3 +392,41 @@ class MiniMaxHiSparseVerify:
         if not self.fast_plan:
             tags.index_copy_(0, tag_rows, plan.labels)
         return plan.indices
+
+
+def flash_mla_chunked_verify(*, query_chunk_size, hot_indices_fn, **kwargs):
+    """Bound resident pages by staging subsets of verify queries exactly.
+
+    Score/TopK and DSpark width are unchanged. Each pass retains all selected
+    pages for its query subset, consumes them before another pass can reuse
+    hot slots, and copies only those output rows into the final result.
+    """
+    from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
+        flash_mla_sparse_decode_main,
+    )
+
+    width = kwargs["verify_group_size"]
+    if width != 8 or query_chunk_size not in (4, 8):
+        raise ValueError("Chunked HiSparse requires verify8 and query chunks 4 or 8")
+    q, topk = kwargs["q"], kwargs["topk_idx"]
+    batch = q.shape[0] // width
+    output = torch.empty_like(q, dtype=torch.bfloat16)
+    # Keep the same native verify8 split/reduction schedule as the unsplit path.
+    # Masked queries are discarded, never used as approximate attention.
+    for start in range(0, width, query_chunk_size):
+        selected = torch.full_like(topk, -1)
+        selected.view(4, batch, width, 16)[
+            :, :, start : start + query_chunk_size
+        ].copy_(topk.view(4, batch, width, 16)[:, :, start : start + query_chunk_size])
+        slots = hot_indices_fn(selected, kwargs["seq_lens"])
+        result = flash_mla_sparse_decode_main(
+            **dict(kwargs, topk_idx=selected, hot_indices=slots)
+        )
+        if result.dtype != output.dtype:
+            raise ValueError("Unexpected FlashMLA output dtype in chunked verify")
+        output.view(batch, width, *q.shape[1:])[
+            :, start : start + query_chunk_size
+        ].copy_(
+            result.view(batch, width, *q.shape[1:])[:, start : start + query_chunk_size]
+        )
+    return output
