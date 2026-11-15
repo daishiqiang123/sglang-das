@@ -1737,8 +1737,14 @@ class MiniMaxM3Attention(nn.Module):
             and sparse.flash_mla_fp8_main_attn_gemm
             and sparse.use_flash_mla_gfx938_indexer
             and sparse.index_fp8_mode == "dot"
-            and sparse.hisparse_coordinator is None
-            and not kv_pool._enable_hisparse
+            and (
+                (sparse.hisparse_coordinator is None and not kv_pool._enable_hisparse)
+                or (
+                    mode.is_target_verify()
+                    and sparse.m3_hisparse_verify is not None
+                    and os.environ.get("M31_HISPARSE_FUSED_QK_CACHE", "0") == "1"
+                )
+            )
             and all(
                 scale in (None, 1.0)
                 for scale in (
@@ -1832,6 +1838,11 @@ class MiniMaxM3Attention(nn.Module):
                     self.rotary_dim,
                     self.rotary_emb.is_neox_style,
                     fp8_cache=fp8_cache_fusion,
+                    main_cache_mapping=(
+                        kv_pool.full_to_hisparse_device_index_mapping
+                        if fp8_cache_fusion and kv_pool._enable_hisparse
+                        else None
+                    ),
                 )
                 self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
                 return q, k, idx_q, idx_k

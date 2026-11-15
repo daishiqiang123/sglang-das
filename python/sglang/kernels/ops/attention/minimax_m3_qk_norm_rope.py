@@ -2,7 +2,7 @@
 """Fused MiniMax-M3 per-head Gemma Q/K RMSNorm + partial RoPE for ROCm."""
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -439,6 +439,7 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     v_cache_ptr,
     idx_k_cache_ptr,
     loc_ptr,
+    main_mapping_ptr,
     q_weight_ptr,
     k_weight_ptr,
     idx_q_weight_ptr,
@@ -475,6 +476,8 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     FP8_CACHE: tl.constexpr,
     CACHE_SLOTS: tl.constexpr,
     INDEX_CACHE_SLOTS: tl.constexpr,
+    HAS_MAIN_MAPPING: tl.constexpr,
+    MAIN_MAPPING_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     head_program = tl.program_id(1)
@@ -598,17 +601,24 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
         tl.store(base_out + cols, out_typed, mask=mask)
 
     loc = tl.load(loc_ptr + token_id)
+    main_loc = loc
+    if HAS_MAIN_MAPPING:
+        main_loc = tl.load(
+            main_mapping_ptr + loc,
+            mask=(loc > 0) & (loc < MAIN_MAPPING_SIZE),
+            other=0,
+        )
     is_idx_k = head_program == idx_k_program
     if FP8_CACHE:
         # Slot zero is reserved for graph padding. Avoid concurrent dummy writes.
-        write_kv = is_k & (loc > 0) & (loc < CACHE_SLOTS)
+        write_kv = is_k & (main_loc > 0) & (main_loc < CACHE_SLOTS)
         write_idx_k = is_idx_k & (loc > 0) & (loc < INDEX_CACHE_SLOTS)
     else:
         write_kv = is_k
         write_idx_k = is_idx_k
     cache_k_base = (
         k_cache_ptr
-        + loc * k_cache_stride_s
+        + main_loc * k_cache_stride_s
         + head_id * k_cache_stride_h
         + cols * k_cache_stride_d
     )
@@ -616,7 +626,7 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     v_val = tl.load(v_base + cols * v_stride_d, mask=mask & write_kv, other=0.0)
     cache_v_base = (
         v_cache_ptr
-        + loc * v_cache_stride_s
+        + main_loc * v_cache_stride_s
         + head_id * v_cache_stride_h
         + cols * v_cache_stride_d
     )
@@ -668,6 +678,7 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     is_neox_style: bool,
     *,
     fp8_cache: bool = False,
+    main_cache_mapping: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse norm/RoPE with main KV and index-K stores.
 
@@ -685,6 +696,12 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     assert idx_q.shape[1] % head_dim == 0
     assert idx_k.shape[1] == head_dim
     assert rotary_dim <= head_dim and rotary_dim % 2 == 0
+
+    if main_cache_mapping is not None:
+        assert fp8_cache
+        assert main_cache_mapping.dim() == 1 and main_cache_mapping.is_contiguous()
+        assert main_cache_mapping.dtype in (torch.int32, torch.int64)
+        assert main_cache_mapping.device == out_cache_loc.device
 
     q_heads = q.shape[1] // head_dim
     k_heads = k.shape[1] // head_dim
@@ -720,6 +737,7 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         v_cache,
         idx_k_cache,
         out_cache_loc,
+        main_cache_mapping if main_cache_mapping is not None else out_cache_loc,
         q_weight,
         k_weight,
         idx_q_weight,
@@ -756,6 +774,8 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         FP8_CACHE=fp8_cache,
         CACHE_SLOTS=k_cache.shape[0],
         INDEX_CACHE_SLOTS=idx_k_cache.shape[0],
+        HAS_MAIN_MAPPING=main_cache_mapping is not None,
+        MAIN_MAPPING_SIZE=0 if main_cache_mapping is None else main_cache_mapping.numel(),
         num_warps=4,
     )
     return q_out, k_out, idx_q_out, idx_k_out
