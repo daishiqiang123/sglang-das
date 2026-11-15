@@ -127,6 +127,7 @@ class MiniMaxHiSparseVerify:
         self.coordinator = coordinator
         self.pages = self.width * self.heads * self.topk
         self.buffer_size = coordinator.device_buffer_size
+        self.headwise = os.environ.get("M31_HISPARSE_HEADWISE_SWAP") == "1"
         self.compact_hot_buffer = self.buffer_size < self.pages * self.page_size
         # Each query/head reserves one local page. A verify8 group spans at most
         # two local pages, leaving 8 * 4 * 15 other page selections.
@@ -136,7 +137,7 @@ class MiniMaxHiSparseVerify:
         if self.query_chunk_size not in (4, 8):
             raise ValueError("MiniMax HiSparse verify query chunk must be 4 or 8")
         min_pages = self.query_chunk_size * self.heads * (self.topk - 1) + 2
-        if self.compact_hot_buffer and (
+        if self.compact_hot_buffer and not self.headwise and (
             os.environ.get("M31_HISPARSE_AB_COMPACT_HOT") != "1"
             or self.buffer_size < min_pages * self.page_size
             or os.environ.get("M31_HISPARSE_FAST_PLAN") != "1"
@@ -155,8 +156,22 @@ class MiniMaxHiSparseVerify:
         self.tiled_swap = os.environ.get("M31_HISPARSE_TILED_SWAP", "")
         if self.tiled_swap:
             self.swap_launch = tuple(map(int, self.tiled_swap.split(",")))
-            if self.swap_launch not in ((128, 16), (128, 32), (256, 16), (256, 32)):
+            supported_launches = (
+                ((128, 4), (256, 4), (256, 8))
+                if self.headwise
+                else ((128, 16), (128, 32), (256, 16), (256, 32))
+            )
+            if self.swap_launch not in supported_launches:
                 raise ValueError("Invalid MiniMax HiSparse tiled swap launch")
+        if self.headwise and (
+            not self.width * self.topk <= self.buffer_size // self.page_size <= 256
+            or self.query_chunk_size != self.width
+            or not self.direct_verify_indices
+            or not self.tiled_swap
+            or os.environ.get("M31_HISPARSE_STABLE_SLOTS") != "1"
+            or os.environ.get("M31_HISPARSE_HIP_STABLE_PLAN") != "1"
+        ):
+            raise ValueError("Invalid buffers or planner for head-wise MiniMax HiSparse")
         pool = coordinator.mem_pool_device
         if pool.size < coordinator.padded_buffer_size:
             raise ValueError("MiniMax HiSparse KV pool cannot hold one request buffer")
@@ -170,8 +185,9 @@ class MiniMaxHiSparseVerify:
             raise ValueError("MiniMax HiSparse requires contiguous token-major KV4")
         # A distinct scratch label row for each padded graph row. Padding may
         # reuse a live request id, so it must never write that request's tags.
+        label_stride = self.heads * (self.buffer_size // self.page_size) if self.headwise else self.pages
         self.labels = torch.full(
-            (layers, 2 * request_slots, self.pages),
+            (layers, 2 * request_slots, label_stride),
             -1,
             dtype=torch.int64,
             device=coordinator.device,
@@ -199,8 +215,9 @@ class MiniMaxHiSparseVerify:
             return None
         host_tokens = self.coordinator.req_to_host_pool.shape[1]
         logical_pages = (host_tokens + self.page_size - 1) // self.page_size
+        map_rows = self.request_slots * (self.heads if self.headwise else 1)
         return torch.full(
-            (layers, self.request_slots, logical_pages),
+            (layers, map_rows, logical_pages),
             -1,
             dtype=torch.int32,
             device=self.labels.device,
@@ -209,7 +226,9 @@ class MiniMaxHiSparseVerify:
     def reset(self, req_pool_idx: int) -> None:
         self.labels[:, req_pool_idx].fill_(-1)
         if self.page_slots is not None:
-            self.page_slots[:, req_pool_idx].fill_(-1)
+            heads_per_request = self.heads if self.headwise else 1
+            start = req_pool_idx * heads_per_request
+            self.page_slots[:, start : start + heads_per_request].fill_(-1)
 
     def _scratch_slots(self, reqs: torch.Tensor) -> torch.Tensor:
         return self.coordinator.req_to_device_buffer[
@@ -313,6 +332,7 @@ class MiniMaxHiSparseVerify:
                 None if self.page_slots is None else self.page_slots[layer],
                 indices_output=indices_output,
                 direct_verify_indices=self.direct_verify_indices,
+                headwise=self.headwise,
             )
         else:
             rows = torch.arange(batch, device=reqs.device)
@@ -362,6 +382,7 @@ class MiniMaxHiSparseVerify:
                 c.mem_pool_device.get_key_buffer(layer_id),
                 c.mem_pool_device.get_value_buffer(layer_id),
                 *self.swap_launch,
+                heads_per_request=self.heads if self.headwise else 1,
             )
         else:
             copy_cache_planned_mha(

@@ -221,18 +221,19 @@ def _expand_indices(
     tl.store(Indices + indices, tl.where(valid, physical, -1))
 
 
-def _hip_stable_plan(*args):
+def _hip_stable_plan(*args, headwise=False):
     from sglang.kernels.jit.utils import load_jit
 
-    return _hip_module(load_jit).plan(*args)
+    return _hip_module(load_jit, headwise).plan(*args)
 
 
 @lru_cache(maxsize=1)
-def _hip_module(load_jit):
+def _hip_module(load_jit, headwise=False):
     return load_jit(
         "minimax_verify_owner_plan",
+        headwise,
         cuda_files=["kvcacheio/minimax_verify_plan.cuh"],
-        cuda_wrappers=[("plan", "minimax_verify::plan")],
+        cuda_wrappers=[("plan", f"minimax_verify::plan<{str(headwise).lower()}>")],
     )
 
 
@@ -249,6 +250,7 @@ def pack_verify_plan(
     *,
     indices_output=None,
     direct_verify_indices=False,
+    headwise=False,
 ):
     batch = reqs.numel()
     width, heads, top, page = 8, 4, 16, 128
@@ -266,12 +268,14 @@ def pack_verify_plan(
             and indices.device == reqs.device
             and indices.is_contiguous()
         )
-    miss_src = torch.empty((batch, count), dtype=torch.int64, **opts)
-    miss_dst = torch.empty_like(hot)
-    miss_count = torch.empty((batch,), dtype=torch.int32, **opts)
+    plan_rows = batch * heads if headwise else batch
+    plan_width = count // heads if headwise else count
+    miss_src = torch.empty((plan_rows, plan_width), dtype=torch.int64, **opts)
+    miss_dst = torch.empty_like(miss_src, dtype=torch.int32)
+    miss_count = torch.empty((plan_rows,), dtype=torch.int32, **opts)
     verify_src = torch.empty((batch, width), dtype=torch.int64, **opts)
     verify_dst = torch.empty((batch, width), dtype=torch.int32, **opts)
-    verify_count = torch.empty_like(miss_count)
+    verify_count = torch.empty((batch,), dtype=torch.int32, **opts)
     shape = (
         batch,
         host.size(0),
@@ -288,13 +292,15 @@ def pack_verify_plan(
     ends = ends.contiguous()
     use_hip = (
         page_slots is not None
-        and buffer_size == count * page
+        and (plan_width * page <= buffer_size <= 256 * page if headwise else buffer_size == count * page)
         and os.environ.get("M31_HISPARSE_HIP_STABLE_PLAN") == "1"
         and reqs.dtype == host.dtype == device.dtype == tags.dtype == torch.int64
         and topk.dtype == ends.dtype == torch.int32
         and reqs.is_contiguous()
         and page_slots.size(1) <= 2048
     )
+    if headwise and not (use_hip and direct_verify_indices):
+        raise ValueError("Head-wise HiSparse requires HIP planning and direct Verify indices")
     if use_hip:
         _hip_stable_plan(
             reqs,
@@ -312,6 +318,7 @@ def pack_verify_plan(
             verify_src,
             verify_dst,
             verify_count,
+            headwise=headwise,
         )
     else:
         _pack_plan[(batch,)](

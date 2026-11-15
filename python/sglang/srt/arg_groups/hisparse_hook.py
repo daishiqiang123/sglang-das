@@ -198,10 +198,27 @@ def validate_hisparse(server_args: ServerArgs) -> None:
                 raise ValueError(
                     "Split-query HiSparse requires the explicit fake-PD compact mode"
                 )
+            headwise = os.environ.get("M31_HISPARSE_HEADWISE_SWAP") == "1"
+            if headwise and not (
+                compact
+                and query_chunk == 8
+                and os.environ.get("M31_HISPARSE_STABLE_SLOTS") == "1"
+                and os.environ.get("M31_HISPARSE_HIP_STABLE_PLAN") == "1"
+                and os.environ.get("M31_HISPARSE_FAST_PLAN") == "1"
+                and os.environ.get("M31_HISPARSE_DIRECT_VERIFY_INDICES") == "1"
+            ):
+                raise ValueError(
+                    "Head-wise HiSparse requires fake-PD compact verify8, "
+                    "HIP stable slots and direct Verify indices"
+                )
             min_size = (query_chunk * 4 * 15 + 2) * 128 if compact else 65536
+            if headwise:
+                # Each KV head gets one independent slot namespace.
+                min_size = query_chunk * 16 * 128
             if (
                 type(size) is not int
                 or size < min_size
+                or (headwise and size > 256 * 128)
                 or size % 128
                 or type(ratio) not in (int, float)
                 or not math.isfinite(ratio)

@@ -516,14 +516,17 @@ def commit_mha_all_layers(
 
 
 @cache_once
-def _jit_swap_mha_pages_tiled(block_size: int, blocks_per_request: int) -> Module:
+def _jit_swap_mha_pages_tiled(
+    block_size: int, blocks_per_request: int, heads_per_request: int
+) -> Module:
     return load_jit(
         "hisparse_swap_mha_pages",
         block_size,
         blocks_per_request,
+        heads_per_request,
         cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
-            ("swap", f"swap_mha_pages_tiled<{block_size}, {blocks_per_request}>")
+            ("swap", f"swap_mha_pages_tiled<{block_size}, {blocks_per_request}, {heads_per_request}>")
         ],
     )
 
@@ -539,9 +542,10 @@ def swap_mha_pages_tiled(
     device_v,
     block_size: int,
     blocks_per_request: int,
+    heads_per_request: int = 1,
 ) -> None:
     """Swap MiniMax 64 KiB K pages and matching V pages from mapped host KV."""
-    _jit_swap_mha_pages_tiled(block_size, blocks_per_request).swap(
+    _jit_swap_mha_pages_tiled(block_size, blocks_per_request, heads_per_request).swap(
         src_locs, dst_locs, counts, real, host_k, host_v, device_k, device_v
     )
 

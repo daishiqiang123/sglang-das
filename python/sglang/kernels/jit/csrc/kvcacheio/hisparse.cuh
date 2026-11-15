@@ -1031,30 +1031,34 @@ void commit_mha_all_layers(
       batch, width, blocks_per_layer, host_k.size(1) * item_size_bytes, item_size_bytes);
 }
 
-template <int BLOCK_SIZE, int BLOCKS_PER_REQUEST>
+template <int BLOCK_SIZE, int BLOCKS_PER_REQUEST, int HEADS_PER_REQUEST = 1>
 __global__ void swap_mha_pages_tiled_kernel(
     const int64_t* src_locs, const int32_t* dst_locs, const int32_t* counts,
     const int32_t* real, const uint4* host_k, const uint4* host_v,
     uint4* device_k, uint4* device_v, int64_t stride) {
   constexpr int vectors_per_page = 65536 / sizeof(uint4);
-  const int request = blockIdx.x / BLOCKS_PER_REQUEST;
-  if (request >= real[0]) return;
-  const int count = counts[request];
+  constexpr int vectors_per_head = 128 / sizeof(uint4);
+  const int plan_row = blockIdx.x / BLOCKS_PER_REQUEST;
+  if (plan_row / HEADS_PER_REQUEST >= real[0]) return;
+  const int head = plan_row % HEADS_PER_REQUEST;
+  const int count = counts[plan_row];
   for (int item = blockIdx.x % BLOCKS_PER_REQUEST; item < count; item += BLOCKS_PER_REQUEST) {
-    const int64_t offset = request * stride + item;
+    const int64_t offset = plan_row * stride + item;
     const int64_t src = src_locs[offset] * vectors_per_page;
     const int64_t dst = int64_t(dst_locs[offset]) * vectors_per_page;
     #pragma unroll 4
-    for (int i = threadIdx.x; i < vectors_per_page; i += BLOCK_SIZE) {
-      const uint4 k = host_k[src + i];
-      const uint4 v = host_v[src + i];
-      device_k[dst + i] = k;
-      device_v[dst + i] = v;
+    for (int i = threadIdx.x; i < vectors_per_page / HEADS_PER_REQUEST; i += BLOCK_SIZE) {
+      const int lane = HEADS_PER_REQUEST == 1 ? i :
+          (i / vectors_per_head * HEADS_PER_REQUEST + head) * vectors_per_head + i % vectors_per_head;
+      const uint4 k = host_k[src + lane];
+      const uint4 v = host_v[src + lane];
+      device_k[dst + lane] = k;
+      device_v[dst + lane] = v;
     }
   }
 }
 
-template <int BLOCK_SIZE, int BLOCKS_PER_REQUEST>
+template <int BLOCK_SIZE, int BLOCKS_PER_REQUEST, int HEADS_PER_REQUEST = 1>
 void swap_mha_pages_tiled(
     tvm::ffi::TensorView src_locs, tvm::ffi::TensorView dst_locs,
     tvm::ffi::TensorView counts, tvm::ffi::TensorView real,
@@ -1067,7 +1071,7 @@ void swap_mha_pages_tiled(
   }
   const auto device = LaunchKernel::resolve_device(src_locs.device());
   LaunchKernel(src_locs.size(0) * BLOCKS_PER_REQUEST, BLOCK_SIZE, device)(
-      swap_mha_pages_tiled_kernel<BLOCK_SIZE, BLOCKS_PER_REQUEST>,
+      swap_mha_pages_tiled_kernel<BLOCK_SIZE, BLOCKS_PER_REQUEST, HEADS_PER_REQUEST>,
       static_cast<const int64_t*>(src_locs.data_ptr()),
       static_cast<const int32_t*>(dst_locs.data_ptr()),
       static_cast<const int32_t*>(counts.data_ptr()),
