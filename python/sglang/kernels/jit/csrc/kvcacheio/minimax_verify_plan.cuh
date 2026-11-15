@@ -7,7 +7,7 @@
 namespace sglang {
 namespace minimax_verify {
 
-constexpr int Threads = 128;
+constexpr int Threads = 256;
 constexpr int Count = 512;
 constexpr int Items = Count / Threads;
 constexpr int Page = 128;
