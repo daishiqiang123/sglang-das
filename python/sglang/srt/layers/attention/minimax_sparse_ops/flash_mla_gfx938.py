@@ -632,6 +632,14 @@ def flash_mla_sparse_prefill_main(
     return output if value_scale == 1.0 else output * value_scale
 
 
+@functools.lru_cache(maxsize=4)
+def _verify_split_override(num_splits: int) -> torch.Tensor:
+    if num_splits not in (1, 2, 4, 8):
+        raise ValueError(f"Unsupported FP8 verify split count: {num_splits}")
+    # The wheel reads the scalar on the host, including during graph capture.
+    return torch.tensor([num_splits], dtype=torch.int32, device="cpu")
+
+
 def flash_mla_sparse_decode_main(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -648,6 +656,7 @@ def flash_mla_sparse_decode_main(
     v_scale: Optional[float] = None,
     verify_group_size: int = 1,
     hot_indices: Optional[torch.Tensor] = None,
+    verify_force_splits: int = 0,
 ) -> torch.Tensor:
     """Run decode or target verify through the native multi-Q interface.
 
@@ -718,6 +727,9 @@ def flash_mla_sparse_decode_main(
     if not is_fp8:
         scale *= unit_scale(q_scale) * unit_scale(k_scale)
     fp8_scales = _fp8_scales(q, q_scale, k_scale, v_scale) if is_fp8 else {}
+    split_kwargs = {}
+    if verify_force_splits and is_fp8:
+        split_kwargs["num_splits"] = _verify_split_override(verify_force_splits)
     output, _ = flash_mla_with_kvcache(
         q_grouped,
         k_paged,
@@ -731,6 +743,7 @@ def flash_mla_sparse_decode_main(
         indices=indices,
         v_cache=v_paged,
         **fp8_scales,
+        **split_kwargs,
     )
     output = output.reshape(rows, 64, 128)
     value_scale = 1.0 if is_fp8 else unit_scale(v_scale)

@@ -59,8 +59,10 @@ def test_indexer_request_segmentation_and_old_stage2(monkeypatch, group, live_bo
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("group", [1, 8])
-def test_verify_final_length_and_scale_applied_once(monkeypatch, dtype, group):
+@pytest.mark.parametrize(("group", "verify_force_splits"), [(1, 0), (8, 0), (8, 8)])
+def test_verify_final_length_and_scale_applied_once(
+    monkeypatch, dtype, group, verify_force_splits
+):
     calls = {}
 
     def expand(blocks, **kwargs):
@@ -93,9 +95,16 @@ def test_verify_final_length_and_scale_applied_once(monkeypatch, dtype, group):
         k_scale=3.0,
         v_scale=5.0,
         verify_group_size=group,
+        verify_force_splits=verify_force_splits,
     )
     assert calls["expand"]["seqused_k"].tolist() == [128 + group, 384 + group]
     assert calls["expand"]["seqused_k"].is_contiguous()
+    if verify_force_splits and dtype == torch.float8_e4m3fn:
+        splits = calls["main"]["num_splits"]
+        assert splits.device.type == "cpu" and splits.dtype == torch.int32
+        assert splits.tolist() == [verify_force_splits]
+    else:
+        assert "num_splits" not in calls["main"]
     if dtype == torch.float8_e4m3fn:
         assert calls["main"]["softmax_scale"] == 0.25
         assert calls["main"]["q_scale"].item() == 2.0

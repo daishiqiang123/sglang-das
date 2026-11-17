@@ -2129,6 +2129,8 @@ class Envs:
     # Select the complete MiniMax FlashMLA backend: indexer, main attention
     # and decode, with live-extent eager prefill metadata.
     SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938 = EnvBool(False)
+    # Pin split-KV for native FP8 target verify. Zero keeps wheel policy.
+    SGLANG_MINIMAX_FLASH_MLA_FP8_VERIFY_SPLITS = EnvInt(0)
     # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.

@@ -789,6 +789,11 @@ def minimax_sparse_decode(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 verify_group_size=verify_group_size,
+                verify_force_splits=(
+                    envs.SGLANG_MINIMAX_FLASH_MLA_FP8_VERIFY_SPLITS.get()
+                    if is_verify
+                    else 0
+                ),
             )
             if (
                 flash_mla_hot_indices_fn is not None
