@@ -3072,13 +3072,20 @@ def _setup_and_run_http_server(
                     use_uvicorn_worker_startup_wait,
                 )
 
+                if os.environ.get("SGLANG_UVICORN_REUSEPORT") == "1":
+                    from sglang.srt.entrypoints.http_reuseport import (
+                        run_uvicorn_with_reuseport as run_uvicorn,
+                    )
+                else:
+                    run_uvicorn = uvicorn.run
+
                 with (
                     use_multiprocessing_spawn_bootstrap(),
                     use_uvicorn_worker_startup_wait(
                         envs.SGLANG_UVICORN_WORKER_STARTUP_TIMEOUT.get()
                     ),
                 ):
-                    uvicorn.run(
+                    run_uvicorn(
                         envs.SGLANG_HTTP_SERVER_APP_PATH.get(),
                         host=get_serving().host,
                         port=get_serving().port,
