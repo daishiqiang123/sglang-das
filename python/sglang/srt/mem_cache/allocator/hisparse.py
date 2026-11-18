@@ -158,12 +158,20 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
+        buffer_indices, _ = self.alloc_device_buffer_with_layout(allocated_indices, need_size)
+        return buffer_indices
+
+    def alloc_device_buffer_with_layout(
+        self, allocated_indices, need_size: int
+    ) -> tuple[torch.Tensor, bool]:
+        """Return the hot buffer and whether it owns freshly allocated whole pages."""
         assert need_size % self.page_size == 0
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         # Zero means unmapped; after alloc_logical_only the mapping is all zeros.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        owns_whole_pages = hisparse_indices.numel() == 0
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             self.free_hisparse_indices(hisparse_indices[need_size:])
@@ -191,7 +199,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 "Hisparse allocation failed in alloc_device_buffer"
             )
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
-        return buffer_indices
+        return buffer_indices, owns_whole_pages
+
+    def free_owned_device_pages(self, buffer_indices: torch.Tensor) -> None:
+        """Return exclusively owned, whole hot-buffer pages in allocator order."""
+        page_ids = buffer_indices[:: self.page_size] // self.page_size
+        self.hisparse_attn_allocator.free_page_ids(page_ids.sort().values)
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         # Page zero is the padding sink and is never owned by a request.

@@ -657,6 +657,7 @@ class HiSparseCoordinator:
         self.req_device_buffer_size = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
+        self._whole_page_device_buffers: set[int] = set()
         self.req_to_host_pool = torch.full(
             (max_num_req_slots, max_compressed_context_len + self.page_size),
             -1,
@@ -1052,9 +1053,17 @@ class HiSparseCoordinator:
         )
         compressed_len = len(compressed_logical_indices)
 
-        buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
-            compressed_logical_indices, alloc_size
-        )
+        allocator = self.token_to_kv_pool_allocator
+        if self.m3_flashmla_verify is not None:
+            buffer_indices, owns_whole_pages = allocator.alloc_device_buffer_with_layout(
+                compressed_logical_indices, alloc_size
+            )
+            if owns_whole_pages:
+                self._whole_page_device_buffers.add(req.kv.req_pool_idx)
+        else:
+            buffer_indices = allocator.alloc_device_buffer(
+                compressed_logical_indices, alloc_size
+            )
         if buffer_indices is None:
             logger.error(
                 "HiSparse: alloc_device_buffer failed for req %s "
@@ -1518,9 +1527,15 @@ class HiSparseCoordinator:
                     :, req_pool_idx, :current_cap
                 ].reshape(-1)
                 owned_locs = self.spec_swap.extend_owned_locs(req_pool_idx, owned_locs)
-            all_hi = torch.unique(owned_locs[owned_locs > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+            if req_pool_idx in self._whole_page_device_buffers:
+                # MiniMax keeps ownership in req_to_device_buffer. Paging only
+                # changes the per-head slot mapping, not the reserved page IDs.
+                self.token_to_kv_pool_allocator.free_owned_device_pages(owned_locs)
+                self._whole_page_device_buffers.remove(req_pool_idx)
+            else:
+                all_hi = torch.unique(owned_locs[owned_locs > 0])
+                if all_hi.numel() > 0:
+                    self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
             compressed_locs = (
                 self.mem_pool_device.translate_loc_from_full_to_compressed(
