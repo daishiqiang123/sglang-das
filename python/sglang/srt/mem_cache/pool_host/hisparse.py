@@ -49,9 +49,13 @@ class HiSparseHostPoolMixin:
                     f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
                 )
 
-            req_to_host_pool[req_pool_idx, allocated_len:page_end] = host_locs.to(
-                device=device, non_blocking=True
-            )
+            destination = req_to_host_pool[req_pool_idx, allocated_len:page_end]
+            if getattr(self, "pin_slot_indices", False) and device.type == "cuda":
+                # Pool allocation returns ordinary CPU indices. Use pinned
+                # storage for the async copy directly into the destination row.
+                destination.copy_(host_locs.pin_memory(), non_blocking=True)
+            else:
+                destination[...] = host_locs.to(device=device, non_blocking=True)
             req_to_host_pool_allocated_len[req_pool_idx] = page_end
 
         return req_to_host_pool[req_pool_idx, start_pos:end_pos]
