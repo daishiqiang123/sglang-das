@@ -825,6 +825,8 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Keep the ROCm HiSparse MHA host KV on private physical pages.
+    SGLANG_HISPARSE_HCU_PIN_HOST_KV = EnvBool(False)
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     # HiCache host<->device transfers use the TMA staging kernel when the GPU

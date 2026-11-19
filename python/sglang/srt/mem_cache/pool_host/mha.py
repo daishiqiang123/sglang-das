@@ -28,6 +28,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import (
     KVScaleLayout,
     MHABufferInfo,
@@ -1224,6 +1225,11 @@ class HiSparseMHATokenToKVPoolHost(HiSparseHostPoolMixin, MHATokenToKVPoolHost):
             host_size=0,
             page_size=page_size,
             layout="layer_first",
+            allocator_type=(
+                "rocm_pinned_kv"
+                if _is_hcu and envs.SGLANG_HISPARSE_HCU_PIN_HOST_KV.get()
+                else "default"
+            ),
             device_capacity_tokens=device_capacity_tokens,
             start_layer=start_layer,
             end_layer=end_layer,

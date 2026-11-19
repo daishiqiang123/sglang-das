@@ -104,6 +104,10 @@ def get_allocator_from_storage(allocator_type):
                 exc,
             )
             return HostTensorAllocator()
+    elif allocator_type == "rocm_pinned_kv":
+        from .rocm_pinned_kv import RocmPinnedKVAllocator
+
+        return RocmPinnedKVAllocator()
     elif allocator_type == "shm":
         return ShmHostTensorAllocator()
     elif allocator_type == "tensorcast":
@@ -229,13 +233,17 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
         registered_ranges = [
             (buffer.data_ptr(), buffer.numel() * buffer.element_size())
         ]
-    if not registered_ranges:
-        return
-
-    remaining_ranges = _cuda_host_unregister_ranges(
-        cudart, registered_ranges, operation="host-pool destroy"
-    )
-    setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
+    if registered_ranges:
+        remaining_ranges = _cuda_host_unregister_ranges(
+            cudart, registered_ranges, operation="host-pool destroy"
+        )
+        setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
+        if remaining_ranges:
+            return
+    registration = getattr(buffer, "_sglang_hisparse_local_mr", None)
+    if registration is not None:
+        registration.close()
+        del buffer._sglang_hisparse_local_mr
 
 
 @lru_cache(maxsize=1)
