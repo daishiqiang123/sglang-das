@@ -705,6 +705,53 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
+        if (
+            is_hcu()
+            and capture_decode_cuda_graph
+            and get_disagg().disaggregation_mode == "decode"
+            and self.verify_num_draft_tokens == self.gamma + 1
+        ):
+            self._warmup_eager_accept_output()
+
+    @torch.inference_mode()
+    def _warmup_eager_accept_output(self) -> None:
+        """Load the eager accept-output modules before the first Decode batch."""
+        import time
+
+        from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+            BuildOutTokens,
+        )
+
+        begin = time.monotonic()
+        max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+        device = self.device
+        verify_width = self.verify_num_draft_tokens
+        draft_tokens = torch.arange(max_bs * self.gamma, device=device).view(
+            max_bs, self.gamma
+        )
+        bonus = torch.full((max_bs,), 41, dtype=torch.int64, device=device)
+        correct_len = torch.arange(max_bs, device=device) % (self.gamma + 1)
+        for batch_size in range(1, max_bs + 1):
+            kwargs = dict(
+                draft_tokens=draft_tokens[:batch_size],
+                correct_len=correct_len[:batch_size],
+                bonus=bonus[:batch_size],
+                verify_num_draft_tokens=verify_width,
+                gamma=self.gamma,
+            )
+            actual = BuildOutTokens.triton(**kwargs)
+            expected = BuildOutTokens.torch(**kwargs)
+            if not torch.equal(actual, expected):
+                raise RuntimeError(
+                    f"DSpark accept-output warmup mismatch at batch {batch_size}"
+                )
+        logger.info(
+            "DSpark eager accept-output warmup finished for B=1..%d, T=%d in %.2f ms",
+            max_bs,
+            verify_width,
+            (time.monotonic() - begin) * 1000,
+        )
+
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
